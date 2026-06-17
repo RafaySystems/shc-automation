@@ -1,0 +1,57 @@
+controller:
+  ip: "129.146.242.133"
+  user: "ubuntu"
+  provision: false
+  ssh_key: "/Users/vijay/Documents/rafay-pytest-framework/keys/oci.key"
+  controller_size: "S"
+  ha: false
+  os_type: "ubuntu24"
+
+oci:
+  config_file: "~/.oci/config"
+  profile: "DEFAULT"
+
+  compartment_id: "ocid1.compartment.oc1..aaaaaaaadbipnkdi7rrn6ksl3ar64cn27uu2wd63ek7w7nx7e3fnk5n5omiq"
+  availability_domain: "PaOl:PHX-AD-1"
+
+  vcn_id:    "ocid1.vcn.oc1.phx.amaaaaaaymbj47qaaozxzu7c2msuz3qxnji4evyzzfwrrqx7jo2zxabkl2bq"
+  subnet_id: "ocid1.subnet.oc1.phx.aaaaaaaaxc7ait6l2jrhdvmahoeefwyliua27uic4l7iha4ynykmabz5sjkq"
+
+  # NSG attached to VM VNIC temporarily for internet access (apt + S3 download)
+  # Must have egress 0.0.0.0/0 rules configured in OCI Console
+  # Flow: bringup VM → attach NSG → apt install + S3 download → detach NSG
+  nsg_id: "ocid1.networksecuritygroup.oc1.phx.aaaaaaaaadw43qbzlrucw7ulmspk5obfhugfnrckxoob4nlsinr3cuupne5q"
+
+  image_id:  "ocid1.image.oc1.phx.aaaaaaaawcv7nuujttlzc3rdgw4svfbnbqlyh7cp5tje27wcseaipgdqm3eq"
+  shape: "VM.Standard.E5.Flex"
+  # ocpus:      
+  # memory_gb:  
+  boot_volume_gb: 530
+  data_volume_gb: 1024
+  ssh_public_key: "/Users/vijay/Documents/rafay-pytest-framework/keys/oci.key.pub"
+  display_name: "shc-{build_no}"
+
+  tags:
+    project: "rafay-airgap"
+    owner: "vijay@rafay.co"
+    env: "dev"
+
+  boot_timeout: 300
+
+dns:
+  hosted_zone_id: "Z1OM749F0P8E4R"   # ← get from Route53 console
+  base_domain: "dev.rafay-edge.net"  # ← already matches your screenshot
+  ttl: 60
+  aws_profile: "vijay-aws"
+
+package:
+  name: "rafay-airgapped-controller-v3.1-39.tar.gz"
+  install_dir: "/opt/rafay"
+  url: ""
+
+kubectl:
+  kubeconfig_path: "~/.kube/config"
+  default_namespace: "rafay-system"
+
+reporting:
+  output_dir: "reports"
