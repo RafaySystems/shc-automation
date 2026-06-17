@@ -147,36 +147,36 @@ def ssh_client(request, raw_config, controller_profile):
     client.connect()
     yield client
 
-    # ── Teardown ──────────────────────────────────────────────────────────────
-    # client.disconnect()
+    ── Teardown ──────────────────────────────────────────────────────────────
+    client.disconnect()
 
-    # if provision and not cli_ip:
-    #     # Step 5: Safety detach NSG
-    #     nsg = getattr(request.session, "_nsg_manager", None)
-    #     if nsg:
-    #         try:
-    #             nsg.detach()
-    #         except Exception as e:
-    #             print(f"[ssh_client] NSG detach warning: {e}")
+    if provision and not cli_ip:
+        # Step 5: Safety detach NSG
+        nsg = getattr(request.session, "_nsg_manager", None)
+        if nsg:
+            try:
+                nsg.detach()
+            except Exception as e:
+                print(f"[ssh_client] NSG detach warning: {e}")
 
-    #     # Step 6: Delete Route53 record via boto3
-    #     dns = getattr(request.session, "_dns_manager", None)
-    #     ip  = getattr(request.session, "_tf_public_ip", "")
-    #     if dns and ip:
-    #         try:
-    #             dns.delete_record(ip)
-    #         except Exception as e:
-    #             print(f"[ssh_client] DNS delete warning: {e}")
+        # Step 6: Delete Route53 record via boto3
+        dns = getattr(request.session, "_dns_manager", None)
+        ip  = getattr(request.session, "_tf_public_ip", "")
+        if dns and ip:
+            try:
+                dns.delete_record(ip)
+            except Exception as e:
+                print(f"[ssh_client] DNS delete warning: {e}")
 
-    #     # Step 7: Terraform destroy — VM + data volume
-    #     tf   = getattr(request.session, "_tf_manager", None)
-    #     keep = getattr(request.session, "_keep_vm", False)
-    #     if tf:
-    #         if keep:
-    #             print(f"[ssh_client] --keep-vm set — skipping terraform destroy")
-    #         else:
-    #             print(f"[ssh_client] Running terraform destroy ...")
-    #             tf.destroy()
+        # Step 7: Terraform destroy — VM + data volume
+        tf   = getattr(request.session, "_tf_manager", None)
+        keep = getattr(request.session, "_keep_vm", False)
+        if tf:
+            if keep:
+                print(f"[ssh_client] --keep-vm set — skipping terraform destroy")
+            else:
+                print(f"[ssh_client] Running terraform destroy ...")
+                tf.destroy()
 
 
 @pytest.fixture(scope="session")
