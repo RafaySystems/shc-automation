@@ -1,0 +1,15 @@
+keys/
+config/dev.yaml
+config/staging.yaml
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+*.tfvars
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.env
+reports/
+*.html
+.DS_Store
