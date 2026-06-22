@@ -11,8 +11,8 @@ VALID_SIZES   = {"S", "M", "L"}
 VALID_OS      = {"ubuntu24", "rhel8", "rhel9"}
 # Size S is non-HA only; Size L is HA only
 SIZE_HA_RULES = {
-    "S": [False],       # S → Non-HA only
-    "M": [True, False], # M → both
+    "S": [True],  # S → both
+    "M": [True], # M → both
     "L": [True],        # L → HA only
 }
 
@@ -60,7 +60,7 @@ class ControllerProfile:
 
     @property
     def memory_gb(self) -> int:
-        return {"S": 64, "M": 96, "L": 192}[self.controller_size]
+        return {"S": 64, "M": 64, "L": 192}[self.controller_size]
 
     def summary(self) -> str:
         return (
@@ -124,6 +124,75 @@ def load_controller_profile(
         ha=resolved_ha,
         os_type=resolve(os_type, "CONTROLLER_OS_TYPE", ctrl.get("os_type", "ubuntu24")),
     )
+
+
+# ── OCI profile helpers ───────────────────────────────────────────────────────
+
+def resolve_image_id(cfg: dict, os_type: str, override_image_id: str = "") -> str:
+    """
+    Resolve OCI image_id for a given os_type.
+
+    Priority:
+      1. Hard override (oci.image_id in dev.yaml or passed directly) — escape hatch for testing
+      2. oci_images[os_type] in dev.yaml
+      3. Raise — never silently use a wrong image
+
+    Example dev.yaml:
+        oci_images:
+          ubuntu24: "ocid1.image.oc1.phx.aaa..."
+          rhel8:    ""    # future
+    """
+    # Priority 1 — hard override
+    if override_image_id:
+        print(f"[config_loader] image_id: using hard override → {override_image_id}")
+        return override_image_id
+
+    # Priority 2 — oci_images map
+    oci_images = cfg.get("oci_images", {})
+    image_id = oci_images.get(os_type, "")
+    if image_id:
+        print(f"[config_loader] image_id: resolved from oci_images[{os_type}] → {image_id}")
+        return image_id
+
+    # Priority 3 — fail loudly
+    available = [k for k, v in oci_images.items() if v]
+    raise ValueError(
+        f"No OCI image_id found for os_type='{os_type}'.\n"
+        f"Add it under 'oci_images:' in dev.yaml.\n"
+        f"Currently configured: {available or 'none'}"
+    )
+
+
+def resolve_size_profile(controller_size: str) -> tuple:
+    """
+    Resolve ocpus and memory_gb for a given controller_size.
+
+    Values are owned here in config_loader.py — no dev.yaml entry needed.
+    dev.yaml only needs to say controller_size: S | M | L
+
+    Size rules:
+      S  →  32 OCPUs / 64GB   — Non-HA only
+      M  →  32 OCPUs / 64GB   — HA or Non-HA
+      L  →  128 OCPUs / 192GB — HA only
+
+    Returns:
+        (ocpus: float, memory_gb: float)
+    """
+    SIZE_PROFILES = {
+        "S": (16.0,  64.0),
+        "M": (24.0,  64.0),
+        "L": (48.0, 192.0),
+    }
+
+    if controller_size not in SIZE_PROFILES:
+        raise ValueError(
+            f"controller_size '{controller_size}' is invalid. "
+            f"Choose from: {sorted(SIZE_PROFILES.keys())}"
+        )
+
+    ocpus, memory_gb = SIZE_PROFILES[controller_size]
+    print(f"[config_loader] size_profile: {controller_size} → {ocpus} OCPUs / {memory_gb}GB RAM")
+    return ocpus, memory_gb
 
 
 # ── Package profile ────────────────────────────────────────────────────────────

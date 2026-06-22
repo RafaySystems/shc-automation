@@ -86,12 +86,9 @@ class SSHClient:
             raise RuntimeError(f"SSH transport not active for {self.host}")
 
         channel = transport.open_session()
-        # No get_pty() — PTY triggers login shell on OCI Ubuntu VMs causing hangs
-        # OCI ubuntu user has NOPASSWD sudo so PTY is not needed
-        channel.set_combine_stderr(True)   # merge stderr into stdout
+        channel.set_combine_stderr(True)
         channel.exec_command(command)
 
-        # Poll until done or timeout
         poll_interval = 0.5
         deadline      = time.time() + timeout
         output_chunks = []
@@ -102,10 +99,113 @@ class SSHClient:
                 output_chunks.append(chunk)
 
             if channel.exit_status_ready():
-                # Drain remaining output
                 while channel.recv_ready():
                     chunk = channel.recv(4096).decode("utf-8", errors="replace")
                     output_chunks.append(chunk)
+                break
+
+            if time.time() > deadline:
+                channel.close()
+                output = "".join(output_chunks)
+                raise TimeoutError(
+                    f"Command timed out after {timeout}s on {self.host}.\n"
+                    f"Command: {command[:200]}\n"
+                    f"Last output: {output[-500:]}"
+                )
+
+            time.sleep(poll_interval)
+
+        exit_code = channel.recv_exit_status()
+        channel.close()
+
+        return "".join(output_chunks).strip(), exit_code
+
+    def run_stream(self, command: str, timeout: int = 120, prefix: str = ""):
+        """
+        Run a command and stream output line by line to stdout in real time.
+        Useful for long-running commands like radm cluster (317 image uploads)
+        where you want to see progress as it happens instead of waiting for completion.
+
+        Returns (full_output_str, exit_code) — same signature as run() so it's
+        a drop-in replacement whenever you need live output.
+
+        Args:
+            command : shell command to run on the remote VM
+            timeout : max seconds to wait (default 120 — increase for long commands)
+            prefix  : optional label printed before each line e.g. "[radm cluster]"
+
+        Usage:
+            out, rc = ssh_client.run_stream(
+                "cd /opt/rafay/... && sudo ./radm cluster --config config.yaml",
+                timeout=1200,
+                prefix="[radm cluster]"
+            )
+
+        Output example (printed live as it runs):
+            [radm cluster] Uploading images...
+            [radm cluster] [##                ] 5%   16/317
+            [radm cluster] [####              ] 10%  32/317
+            ...
+        """
+        if not self._client:
+            raise RuntimeError("SSH not connected — call connect() first")
+
+        transport = self._client.get_transport()
+        if not transport or not transport.is_active():
+            raise RuntimeError(f"SSH transport not active for {self.host}")
+
+        channel = transport.open_session()
+        channel.set_combine_stderr(True)
+        channel.exec_command(command)
+
+        poll_interval  = 0.1          # tighter poll for more responsive output
+        deadline       = time.time() + timeout
+        output_chunks  = []
+        line_buffer    = ""           # incomplete line carried between chunks
+        label          = f"{prefix} " if prefix else ""
+
+        while True:
+            # Drain all available data
+            while channel.recv_ready():
+                chunk = channel.recv(4096).decode("utf-8", errors="replace")
+                output_chunks.append(chunk)
+
+                # Split into lines and print each one as it arrives
+                # Handles \r (progress bars) and \n (normal lines)
+                data = line_buffer + chunk
+                # Normalize \r\n → \n, then split on \r or \n
+                lines = data.replace("\r\n", "\n").split("\r")
+
+                for i, segment in enumerate(lines):
+                    parts = segment.split("\n")
+                    for j, part in enumerate(parts):
+                        is_last = (i == len(lines) - 1) and (j == len(parts) - 1)
+                        if is_last:
+                            # Incomplete line — keep in buffer
+                            line_buffer = part
+                        else:
+                            if part.strip():
+                                print(f"{label}{part}", flush=True)
+
+            if channel.exit_status_ready():
+                # Drain remaining data
+                while channel.recv_ready():
+                    chunk = channel.recv(4096).decode("utf-8", errors="replace")
+                    output_chunks.append(chunk)
+                    data = line_buffer + chunk
+                    lines = data.replace("\r\n", "\n").split("\r")
+                    for i, segment in enumerate(lines):
+                        parts = segment.split("\n")
+                        for j, part in enumerate(parts):
+                            is_last = (i == len(lines) - 1) and (j == len(parts) - 1)
+                            if is_last:
+                                line_buffer = part
+                            else:
+                                if part.strip():
+                                    print(f"{label}{part}", flush=True)
+                # Print any remaining buffered content
+                if line_buffer.strip():
+                    print(f"{label}{line_buffer}", flush=True)
                 break
 
             if time.time() > deadline:
