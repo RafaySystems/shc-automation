@@ -56,11 +56,11 @@ class ControllerProfile:
 
     @property
     def cpu(self) -> int:
-        return {"S": 32, "M": 32, "L": 128}[self.controller_size]
+        return {"S": 16, "M": 24, "L": 48}[self.controller_size]
 
     @property
     def memory_gb(self) -> int:
-        return {"S": 64, "M": 64, "L": 192}[self.controller_size]
+        return {"S": 64, "M": 96, "L": 192}[self.controller_size]
 
     def summary(self) -> str:
         return (

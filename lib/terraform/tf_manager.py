@@ -40,9 +40,16 @@ class TerraformManager:
                 "Install: brew install terraform"
             )
 
-    def apply(self, build_no: Optional[str] = None, dns_cfg: Optional[dict] = None) -> tuple:
+    def apply(self, build_no: Optional[str] = None, dns_cfg: Optional[dict] = None,
+              controller_profile=None) -> tuple:
         """
         Generate tfvars → terraform init → apply.
+
+        Args:
+            controller_profile: optional ControllerProfile — if provided, its cpu/memory_gb
+                                 override the raw oci.ocpus/memory_gb from dev.yaml so that
+                                 controller_size: "M" in dev.yaml automatically provisions
+                                 the correct VM hardware size.
 
         Returns:
             (instance_ids, public_ips, fqdn)
@@ -54,7 +61,7 @@ class TerraformManager:
         display_name      = self.profile.resolve_display_name(build_no)
 
         print(f"\n[TerraformManager] Generating terraform.tfvars from dev.yaml ...")
-        self._write_tfvars(display_name, dns_cfg)
+        self._write_tfvars(display_name, dns_cfg, controller_profile)
 
         print(f"[TerraformManager] Running terraform init ...")
         self._run(["terraform", "init", "-upgrade"], "terraform init")
@@ -95,12 +102,26 @@ class TerraformManager:
 
     # ── private ───────────────────────────────────────────────────────────────
 
-    def _write_tfvars(self, display_name: str, dns_cfg: Optional[dict]):
+    def _write_tfvars(self, display_name: str, dns_cfg: Optional[dict],
+                      controller_profile=None):
         p  = self.profile
         ha = getattr(p, 'ha', False)
 
         if not Path(p.ssh_public_key).exists():
             raise FileNotFoundError(f"SSH public key not found: {p.ssh_public_key}")
+
+        # Use controller_profile cpu/memory if provided — this ensures the VM
+        # hardware matches controller_size (S/M/L) defined in dev.yaml.
+        # Falls back to raw oci.ocpus / oci.memory_gb if no profile passed.
+        if controller_profile:
+            ocpus     = controller_profile.cpu
+            memory_gb = controller_profile.memory_gb
+            print(f"[TerraformManager] VM sizing from controller_size="
+                  f"{controller_profile.controller_size}: "
+                  f"{ocpus} vCPUs / {memory_gb}GB RAM")
+        else:
+            ocpus     = p.ocpus
+            memory_gb = p.memory_gb
 
         tags_hcl = "{\n" + "".join(
             f'  "{k}" = "{v}"\n' for k, v in (p.tags or {}).items()
@@ -117,8 +138,8 @@ availability_domain = "{p.availability_domain}"
 subnet_id           = "{p.subnet_id}"
 image_id            = "{p.image_id}"
 shape               = "{p.shape}"
-ocpus               = {p.ocpus}
-memory_gb           = {p.memory_gb}
+ocpus               = {ocpus}
+memory_gb           = {memory_gb}
 boot_volume_gb      = {p.boot_volume_gb}
 data_volume_gb      = {p.data_volume_gb}
 ssh_public_key_path = "{p.ssh_public_key}"
@@ -133,10 +154,10 @@ tags                = {tags_hcl}
 """
 
         self.tfvars_path.write_text(content)
-        print(f"[TerraformManager] tfvars written (ha={ha})")
+        print(f"[TerraformManager] tfvars written (ha={ha}, ocpus={ocpus}, memory_gb={memory_gb})")
 
     def _parse_outputs(self) -> tuple:
-        outputs     = self.output()
+        outputs = self.output()
 
         # HA mode returns lists, non-HA also returns lists (count=1)
         instance_ids = outputs.get("instance_ids", [])

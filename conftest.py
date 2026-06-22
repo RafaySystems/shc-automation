@@ -86,8 +86,13 @@ def ssh_client(request, raw_config, controller_profile):
         build_no    = request.config.getoption("--build-no") or os.environ.get("BUILD_NUMBER")
 
         # Step 1: Terraform — create OCI VM(s) + data volume(s)
+        # Pass controller_profile so VM hardware matches controller_size (S/M/L)
         print("\n[ssh_client] Provisioning VM(s) via Terraform ...")
-        instance_ids, public_ips, _ = tf_manager.apply(build_no=build_no, dns_cfg=dns_cfg)
+        instance_ids, public_ips, _ = tf_manager.apply(
+            build_no=build_no,
+            dns_cfg=dns_cfg,
+            controller_profile=controller_profile,
+        )
         instance_id = instance_ids[0]   # primary node
         ip          = public_ips[0]     # primary node IP
         print(f"[ssh_client] VM ready — id={instance_id}  ip={ip}")
@@ -147,7 +152,7 @@ def ssh_client(request, raw_config, controller_profile):
     client.connect()
     yield client
 
-    ── Teardown ──────────────────────────────────────────────────────────────
+    # ── Teardown ──────────────────────────────────────────────────────────────
     client.disconnect()
 
     if provision and not cli_ip:
@@ -180,31 +185,47 @@ def ssh_client(request, raw_config, controller_profile):
 
 
 @pytest.fixture(scope="session")
-def secondary_ips(request):
+def secondary_ips(request, raw_config):
     """
     List of secondary node IPs for HA mode.
     Sources (in priority order):
       1. --secondary-ips CLI flag  e.g. --secondary-ips=1.2.3.4,5.6.7.8
-      2. Terraform session output  (when provision:true)
+      2. controller.secondary_ips in dev.yaml
+      3. Terraform session output  (when provision:true)
     """
     cli_ips = request.config.getoption("--secondary-ips", default=None)
     if cli_ips:
         return [ip.strip() for ip in cli_ips.split(",") if ip.strip()]
+    # Read from dev.yaml — skip empty strings (placeholder values)
+    yaml_ips = raw_config.get("controller", {}).get("secondary_ips", [])
+    yaml_ips_clean = [ip.strip() for ip in (yaml_ips or []) if ip and ip.strip()]
+    if yaml_ips_clean:
+        return yaml_ips_clean
+    # Fall back to Terraform output (provision:true)
     all_ips = getattr(request.session, "_tf_public_ips", [])
     return all_ips[1:] if len(all_ips) > 1 else []
 
 
 @pytest.fixture(scope="session")
-def secondary_instance_ids(request):
+def secondary_instance_ids(request, raw_config):
     """
     List of secondary node instance IDs for HA mode.
     Sources (in priority order):
       1. --secondary-ids CLI flag
-      2. Terraform session output (when provision:true)
+      2. controller.secondary_ids in dev.yaml
+      3. Terraform session output (when provision:true)
+    Instance IDs are optional — only needed for NSG management.
+    Returns empty strings if not provided (NSG skipped for those nodes).
     """
     cli_ids = request.config.getoption("--secondary-ids", default=None)
     if cli_ids:
         return [i.strip() for i in cli_ids.split(",") if i.strip()]
+    # Read from dev.yaml — skip empty strings (placeholder values)
+    yaml_ids = raw_config.get("controller", {}).get("secondary_ids", [])
+    yaml_ids_clean = [i.strip() for i in (yaml_ids or []) if i and i.strip()]
+    if yaml_ids_clean:
+        return yaml_ids_clean
+    # Fall back to Terraform output (provision:true)
     all_ids = getattr(request.session, "_tf_instance_ids", [])
     return all_ids[1:] if len(all_ids) > 1 else []
 
@@ -229,10 +250,12 @@ def nsg_manager(request, raw_config):
     NSG manager for the primary node.
     Works in both provision:true (from Terraform) and provision:false (from CLI flag).
     """
-    # Try to get instance ID from session (provision:true) or CLI (provision:false)
+    # Try to get instance ID from session (provision:true), CLI, or dev.yaml
     instance_id = getattr(request.session, "_tf_instance_id", None)
     if not instance_id:
         instance_id = request.config.getoption("--controller-instance-id", default=None)
+    if not instance_id:
+        instance_id = raw_config.get("controller", {}).get("instance_id", "") or None
 
     if instance_id and raw_config.get("oci", {}).get("nsg_id"):
         from lib.oci.vm_manager import OCINSGManager, load_oci_profile

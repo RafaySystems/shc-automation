@@ -16,13 +16,7 @@ class SSHClient:
         self._client  = None
 
     def connect(self, retries: int = 10, retry_interval: int = 15):
-        """
-        Connect with retries — OCI VMs take 30-60s after RUNNING
-        before SSH daemon is ready to accept connections.
-
-        retries       : how many attempts before giving up (default 10 = ~2.5 min)
-        retry_interval: seconds between attempts (default 15)
-        """
+        """Connect with retries."""
         key_path = Path(self.key_path)
         if not key_path.exists():
             raise FileNotFoundError(
@@ -30,7 +24,6 @@ class SSHClient:
                 f"Check the ssh_key path in dev.yaml."
             )
 
-        # Load key — try RSA first, then Ed25519, then ECDSA
         pkey = self._load_private_key(key_path)
 
         last_error = None
@@ -46,9 +39,12 @@ class SSHClient:
                     pkey=pkey,
                     port=self.port,
                     timeout=self.timeout,
-                    look_for_keys=False,   # only use the key we explicitly loaded
-                    allow_agent=False,     # don't use ssh-agent
+                    look_for_keys=False,
+                    allow_agent=False,
                 )
+                # Keepalive every 30s — prevents connection drop during
+                # long-running commands like radm init/join (~15 min)
+                client.get_transport().set_keepalive(30)
                 self._client = client
                 print(f"[SSHClient] Connected to {self.host} ✓")
                 return
@@ -74,14 +70,59 @@ class SSHClient:
         )
 
     def run(self, command: str, timeout: int = 120):
-        """Run a command and return (stdout_str, exit_code)."""
+        """
+        Run a command and return (stdout_str, exit_code).
+
+        Uses polling so long-running commands (radm init/join ~15 min)
+        don't get killed by a socket read timeout.
+        No PTY — avoids login shell hang on some OCI Ubuntu VMs.
+        Sudo works without PTY since OCI ubuntu user has NOPASSWD sudoers.
+        """
         if not self._client:
             raise RuntimeError("SSH not connected — call connect() first")
-        stdin, stdout, stderr = self._client.exec_command(command, timeout=timeout)
-        exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode("utf-8", errors="replace").strip()
-        err = stderr.read().decode("utf-8", errors="replace").strip()
-        return (out + ("\n" + err if err else "")), exit_code
+
+        transport = self._client.get_transport()
+        if not transport or not transport.is_active():
+            raise RuntimeError(f"SSH transport not active for {self.host}")
+
+        channel = transport.open_session()
+        # No get_pty() — PTY triggers login shell on OCI Ubuntu VMs causing hangs
+        # OCI ubuntu user has NOPASSWD sudo so PTY is not needed
+        channel.set_combine_stderr(True)   # merge stderr into stdout
+        channel.exec_command(command)
+
+        # Poll until done or timeout
+        poll_interval = 0.5
+        deadline      = time.time() + timeout
+        output_chunks = []
+
+        while True:
+            while channel.recv_ready():
+                chunk = channel.recv(4096).decode("utf-8", errors="replace")
+                output_chunks.append(chunk)
+
+            if channel.exit_status_ready():
+                # Drain remaining output
+                while channel.recv_ready():
+                    chunk = channel.recv(4096).decode("utf-8", errors="replace")
+                    output_chunks.append(chunk)
+                break
+
+            if time.time() > deadline:
+                channel.close()
+                output = "".join(output_chunks)
+                raise TimeoutError(
+                    f"Command timed out after {timeout}s on {self.host}.\n"
+                    f"Command: {command[:200]}\n"
+                    f"Last output: {output[-500:]}"
+                )
+
+            time.sleep(poll_interval)
+
+        exit_code = channel.recv_exit_status()
+        channel.close()
+
+        return "".join(output_chunks).strip(), exit_code
 
     def disconnect(self):
         if self._client:
@@ -91,10 +132,6 @@ class SSHClient:
     # ── private ───────────────────────────────────────────────────────────────
 
     def _load_private_key(self, key_path: Path) -> paramiko.PKey:
-        """
-        Try loading the private key as RSA, Ed25519, then ECDSA.
-        Raises a clear error if none work.
-        """
         key_types = [
             ("RSA",     paramiko.RSAKey),
             ("Ed25519", paramiko.Ed25519Key),

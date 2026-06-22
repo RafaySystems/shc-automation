@@ -1,7 +1,8 @@
 controller:
-  ip: "129.146.242.133"
+  ip: ""
   user: "ubuntu"
-  provision: false
+  secondary_ips: []
+  provision: true
   ssh_key: "/Users/vijay/Documents/rafay-pytest-framework/keys/oci.key"
   controller_size: "S"
   ha: false
