@@ -20,6 +20,9 @@ def pytest_addoption(parser):
     parser.addoption("--secondary-ips",   default=None,   help="Comma-separated IPs of secondary nodes e.g. 1.2.3.4,5.6.7.8")
     parser.addoption("--secondary-ids",   default=None,   help="Comma-separated OCI instance IDs of secondary nodes")
     parser.addoption("--controller-instance-id", default=None, help="OCI instance ID of primary node (for NSG in static IP mode)")
+    # ── NEW ───────────────────────────────────────────────────────────────────
+    parser.addoption("--skip-bringup",    action="store_true", default=False,
+                     help="Skip controller bringup — run validation tests only against existing install")
 
 
 @pytest.fixture(scope="session")
@@ -86,18 +89,17 @@ def ssh_client(request, raw_config, controller_profile):
         build_no    = request.config.getoption("--build-no") or os.environ.get("BUILD_NUMBER")
 
         # Step 1: Terraform — create OCI VM(s) + data volume(s)
-        # Pass controller_profile so VM hardware matches controller_size (S/M/L)
         print("\n[ssh_client] Provisioning VM(s) via Terraform ...")
         instance_ids, public_ips, _ = tf_manager.apply(
             build_no=build_no,
             dns_cfg=dns_cfg,
             controller_profile=controller_profile,
         )
-        instance_id = instance_ids[0]   # primary node
-        ip          = public_ips[0]     # primary node IP
+        instance_id = instance_ids[0]
+        ip          = public_ips[0]
         print(f"[ssh_client] VM ready — id={instance_id}  ip={ip}")
 
-        # Step 2: boto3 Route53 — create DNS record using vijay-aws profile
+        # Step 2: boto3 Route53 — create DNS record
         dns_mgr = None
         fqdn    = ""
         if dns_cfg.get("hosted_zone_id"):
@@ -110,13 +112,12 @@ def ssh_client(request, raw_config, controller_profile):
         else:
             print(f"[ssh_client] No dns.hosted_zone_id in dev.yaml — skipping DNS")
 
-        # Step 3: NSG attach — internet access for apt + S3 download on all nodes
+        # Step 3: NSG attach — internet access for apt + S3 download
         nsg_mgr = None
         if oci_profile.nsg_id:
             print(f"[ssh_client] Attaching NSG to primary node ...")
             nsg_mgr = OCINSGManager(oci_profile, instance_id)
             nsg_mgr.attach()
-            # Attach to secondary nodes too (HA mode)
             for sec_id in instance_ids[1:]:
                 try:
                     sec_nsg = OCINSGManager(oci_profile, sec_id)
@@ -156,7 +157,6 @@ def ssh_client(request, raw_config, controller_profile):
     client.disconnect()
 
     if provision and not cli_ip:
-        # Step 5: Safety detach NSG
         nsg = getattr(request.session, "_nsg_manager", None)
         if nsg:
             try:
@@ -164,7 +164,6 @@ def ssh_client(request, raw_config, controller_profile):
             except Exception as e:
                 print(f"[ssh_client] NSG detach warning: {e}")
 
-        # Step 6: Delete Route53 record via boto3
         dns = getattr(request.session, "_dns_manager", None)
         ip  = getattr(request.session, "_tf_public_ip", "")
         if dns and ip:
@@ -173,7 +172,6 @@ def ssh_client(request, raw_config, controller_profile):
             except Exception as e:
                 print(f"[ssh_client] DNS delete warning: {e}")
 
-        # Step 7: Terraform destroy — VM + data volume
         tf   = getattr(request.session, "_tf_manager", None)
         keep = getattr(request.session, "_keep_vm", False)
         if tf:
@@ -186,57 +184,58 @@ def ssh_client(request, raw_config, controller_profile):
 
 @pytest.fixture(scope="session")
 def secondary_ips(request, raw_config):
-    """
-    List of secondary node IPs for HA mode.
-    Sources (in priority order):
-      1. --secondary-ips CLI flag  e.g. --secondary-ips=1.2.3.4,5.6.7.8
-      2. controller.secondary_ips in dev.yaml
-      3. Terraform session output  (when provision:true)
-    """
     cli_ips = request.config.getoption("--secondary-ips", default=None)
     if cli_ips:
         return [ip.strip() for ip in cli_ips.split(",") if ip.strip()]
-    # Read from dev.yaml — skip empty strings (placeholder values)
     yaml_ips = raw_config.get("controller", {}).get("secondary_ips", [])
     yaml_ips_clean = [ip.strip() for ip in (yaml_ips or []) if ip and ip.strip()]
     if yaml_ips_clean:
         return yaml_ips_clean
-    # Fall back to Terraform output (provision:true)
     all_ips = getattr(request.session, "_tf_public_ips", [])
     return all_ips[1:] if len(all_ips) > 1 else []
 
 
 @pytest.fixture(scope="session")
 def secondary_instance_ids(request, raw_config):
-    """
-    List of secondary node instance IDs for HA mode.
-    Sources (in priority order):
-      1. --secondary-ids CLI flag
-      2. controller.secondary_ids in dev.yaml
-      3. Terraform session output (when provision:true)
-    Instance IDs are optional — only needed for NSG management.
-    Returns empty strings if not provided (NSG skipped for those nodes).
-    """
+    # Priority 1 — CLI flag
     cli_ids = request.config.getoption("--secondary-ids", default=None)
     if cli_ids:
         return [i.strip() for i in cli_ids.split(",") if i.strip()]
-    # Read from dev.yaml — skip empty strings (placeholder values)
+
+    # Priority 2 — dev.yaml secondary_ids
     yaml_ids = raw_config.get("controller", {}).get("secondary_ids", [])
     yaml_ids_clean = [i.strip() for i in (yaml_ids or []) if i and i.strip()]
     if yaml_ids_clean:
         return yaml_ids_clean
-    # Fall back to Terraform output (provision:true)
+
+    # Priority 3 — Terraform session output (provision: true)
     all_ids = getattr(request.session, "_tf_instance_ids", [])
-    return all_ids[1:] if len(all_ids) > 1 else []
+    if len(all_ids) > 1:
+        return all_ids[1:]
+
+    # Priority 4 — read_state() from existing tfstate (provision: false, VMs from TF)
+    # Handles case where VMs were created by Terraform but provision: false is set
+    # for iterative re-runs without re-provisioning.
+    # Falls back gracefully — returns [] if no tfstate found (no crash, NSG skipped)
+    provision = raw_config.get("controller", {}).get("provision", False)
+    if not provision:
+        try:
+            from lib.oci.vm_manager import load_oci_profile
+            from lib.terraform.tf_manager import TerraformManager
+            oci_profile = load_oci_profile(raw_config)
+            tf_manager  = TerraformManager(oci_profile)
+            all_ids, _, _ = tf_manager.read_state()
+            if len(all_ids) > 1:
+                print(f"[secondary_instance_ids] read_state: found {len(all_ids)-1} secondary ID(s) from tfstate")
+                return all_ids[1:]
+        except Exception as e:
+            print(f"[secondary_instance_ids] read_state failed ({e}) — NSG will be skipped for secondary nodes")
+
+    return []
 
 
 @pytest.fixture(scope="session")
 def oci_profile_fixture(request, raw_config):
-    """
-    Expose OCIProfile to tests that need to manage NSG directly.
-    Works in both provision:true and provision:false modes
-    as long as oci: section is present in dev.yaml.
-    """
     from lib.oci.vm_manager import load_oci_profile
     try:
         return load_oci_profile(raw_config)
@@ -246,11 +245,6 @@ def oci_profile_fixture(request, raw_config):
 
 @pytest.fixture(scope="session")
 def nsg_manager(request, raw_config):
-    """
-    NSG manager for the primary node.
-    Works in both provision:true (from Terraform) and provision:false (from CLI flag).
-    """
-    # Try to get instance ID from session (provision:true), CLI, or dev.yaml
     instance_id = getattr(request.session, "_tf_instance_id", None)
     if not instance_id:
         instance_id = request.config.getoption("--controller-instance-id", default=None)
@@ -270,28 +264,82 @@ def nsg_manager(request, raw_config):
 
     yield getattr(request.session, "_nsg_manager", None)
 
+
 @pytest.fixture(scope="session")
 def _nsg_manager_orig(request):
-    """OCINSGManager for attach/detach internet access during package download."""
     return getattr(request.session, "_nsg_manager", None)
 
 
 @pytest.fixture(scope="session")
 def controller_fqdn(request):
-    """
-    Wildcard FQDN for this controller e.g. *.shc-42.dev.rafay-edge.net
-    Used to set star-domain in radm config.yaml.
-    Returns empty string if DNS not configured.
-    """
     return getattr(request.session, "_tf_fqdn", "")
 
 
 @pytest.fixture(scope="session")
 def package_profile(request, raw_config):
-    """Loads PackageProfile from dev.yaml package: section."""
     profile = load_package_profile(
         cfg=raw_config,
         package_name=request.config.getoption("--package-name"),
     )
     print(f"\n[conftest] {profile.summary()}")
     return profile
+
+
+# ── NEW: controller_bringup fixture ──────────────────────────────────────────
+@pytest.fixture(scope="session", autouse=True)
+def controller_bringup(
+    request,
+    ssh_client,
+    controller_profile,
+    package_profile,
+    controller_fqdn,
+    secondary_ips,
+    secondary_instance_ids,
+    oci_profile_fixture,
+    nsg_manager,
+    raw_config,
+):
+    """
+    Runs full controller bringup ONCE per session before any test runs.
+    VM is already provisioned by ssh_client fixture above — this just
+    does the install (download, extract, radm phases).
+
+    Skip with --skip-bringup to re-run validation only against existing install:
+        pytest tests/ --skip-bringup --provision=false --controller-ip=<ip>
+
+    Normal Jenkins run:
+        pytest tests/ --controller-size=M --package-name=rafay-airgapped-controller-v3.1-39.tar.gz
+    """
+    from lib.controller.bringup import ControllerBringup, BringupError
+
+    # --skip-bringup: validation only, no install steps
+    if request.config.getoption("--skip-bringup"):
+        print("[conftest] --skip-bringup — skipping install, running validation only")
+        yield
+        return
+
+    # Resolve star_domain from FQDN or build-no + base_domain
+    if controller_fqdn:
+        star_domain = controller_fqdn.lstrip("*.")
+    else:
+        base_domain  = raw_config.get("dns", {}).get("base_domain", "")
+        build_no_val = request.config.getoption("--build-no") or ""
+        star_domain  = f"shc-{build_no_val}.{base_domain}" if base_domain and build_no_val else ""
+
+    bringup = ControllerBringup(
+        ssh_client=ssh_client,
+        controller_profile=controller_profile,
+        package_profile=package_profile,
+        star_domain=star_domain,
+        secondary_ips=secondary_ips,
+        secondary_instance_ids=secondary_instance_ids,
+        oci_profile=oci_profile_fixture,
+        nsg_manager=nsg_manager,
+    )
+
+    try:
+        bringup.run()
+    except BringupError as e:
+        pytest.fail(f"Controller bringup failed at phase [{e.phase}]: {e}")
+
+    yield   # validation tests run after this point

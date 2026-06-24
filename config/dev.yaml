@@ -1,11 +1,11 @@
 controller:
-  ip: ""
+  ip: "161.153.121.7"
   user: "ubuntu"
-  secondary_ips: []
-  provision: true
+  secondary_ips: ["129.146.245.114","158.101.12.37"]
+  provision: false
   ssh_key: "/Users/vijay/Documents/rafay-pytest-framework/keys/oci.key"
   controller_size: "S"
-  ha: false
+  ha: true
   os_type: "ubuntu24"
 
 oci:
@@ -56,3 +56,9 @@ kubectl:
 
 reporting:
   output_dir: "reports"
+
+#incase of using dev package for testing, update the package name and url here
+package:
+  name: "rafay-airgapped-controller-v3.1-40.tar.gz"
+  install_dir: "/opt/rafay"
+  url: "https://dev-rafay-controller.s3.us-west-1.amazonaws.com/Automation/rafay-airgapped-controller-v3.1-40.tar.gz"
