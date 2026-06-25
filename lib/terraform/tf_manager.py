@@ -45,17 +45,8 @@ class TerraformManager:
         """
         Generate tfvars → terraform init → apply.
 
-        Args:
-            controller_profile: optional ControllerProfile — if provided, its cpu/memory_gb
-                                 override the raw oci.ocpus/memory_gb from dev.yaml so that
-                                 controller_size: "M" in dev.yaml automatically provisions
-                                 the correct VM hardware size.
-
         Returns:
             (instance_ids, public_ips, fqdn)
-            instance_ids : list of instance OCIDs  [node1, node2, node3] or [node1]
-            public_ips   : list of public IPs       [ip1, ip2, ip3]       or [ip1]
-            fqdn         : wildcard DNS string or ""
         """
         self._aws_profile = (dns_cfg or {}).get("aws_profile", "")
         display_name      = self.profile.resolve_display_name(build_no)
@@ -100,6 +91,67 @@ class TerraformManager:
         raw = json.loads(result.stdout)
         return {k: v["value"] for k, v in raw.items()}
 
+    def read_state(self) -> tuple:
+        """
+        Read instance_ids and public_ips from existing terraform.tfstate
+        WITHOUT running terraform apply.
+
+        Used when provision: false but VMs were originally created by Terraform
+        — avoids manual copy-paste of instance OCIDs into dev.yaml.
+
+        Priority:
+          1. terraform output -json  (fast, uses cached state)
+          2. parse terraform.tfstate directly (fallback)
+          3. return ([], [], "") silently if no state exists — caller handles gracefully
+
+        Returns:
+            (instance_ids, public_ips, fqdn)
+            Returns ([], [], "") if no tfstate found — no crash, caller skips NSG.
+
+        Example:
+            ids, ips, fqdn = tf_manager.read_state()
+            # ids = ["ocid1.instance...node1", "ocid1.instance...node2", "ocid1.instance...node3"]
+            # ips = ["144.24.53.28", "144.24.51.116", "132.226.74.178"]
+        """
+        tfstate_path = self.terraform_dir / "terraform.tfstate"
+
+        # ── Method 1: terraform output -json (uses .terraform/ cache) ─────────
+        # Works if terraform init was previously run in this directory
+        try:
+            result = self._run(
+                ["terraform", "output", "-json"],
+                "terraform output (read_state)",
+                capture=True
+            )
+            raw = json.loads(result.stdout)
+            if raw:
+                outputs = {k: v["value"] for k, v in raw.items()}
+                instance_ids, public_ips, fqdn = self._parse_outputs_from_dict(outputs)
+                if instance_ids and public_ips:
+                    print(f"[TerraformManager] read_state: found {len(instance_ids)} node(s) via terraform output")
+                    for i, (iid, ip) in enumerate(zip(instance_ids, public_ips), 1):
+                        print(f"  node{i}: {ip}  ({iid})")
+                    return instance_ids, public_ips, fqdn
+        except Exception as e:
+            print(f"[TerraformManager] read_state: terraform output failed ({e}) — trying tfstate file ...")
+
+        # ── Method 2: parse terraform.tfstate directly ────────────────────────
+        if tfstate_path.exists():
+            try:
+                state = json.loads(tfstate_path.read_text())
+                instance_ids, public_ips = self._extract_from_tfstate(state)
+                if instance_ids and public_ips:
+                    print(f"[TerraformManager] read_state: found {len(instance_ids)} node(s) via tfstate file")
+                    for i, (iid, ip) in enumerate(zip(instance_ids, public_ips), 1):
+                        print(f"  node{i}: {ip}  ({iid})")
+                    return instance_ids, public_ips, ""
+            except Exception as e:
+                print(f"[TerraformManager] read_state: tfstate parse failed ({e})")
+
+        # ── Method 3: no state found — return empty, caller handles ──────────
+        print(f"[TerraformManager] read_state: no tfstate found at {tfstate_path} — skipping NSG for secondary nodes")
+        return [], [], ""
+
     # ── private ───────────────────────────────────────────────────────────────
 
     def _write_tfvars(self, display_name: str, dns_cfg: Optional[dict],
@@ -110,9 +162,6 @@ class TerraformManager:
         if not Path(p.ssh_public_key).exists():
             raise FileNotFoundError(f"SSH public key not found: {p.ssh_public_key}")
 
-        # Use controller_profile cpu/memory if provided — this ensures the VM
-        # hardware matches controller_size (S/M/L) defined in dev.yaml.
-        # Falls back to raw oci.ocpus / oci.memory_gb if no profile passed.
         if controller_profile:
             ocpus     = controller_profile.cpu
             memory_gb = controller_profile.memory_gb
@@ -158,8 +207,10 @@ tags                = {tags_hcl}
 
     def _parse_outputs(self) -> tuple:
         outputs = self.output()
+        return self._parse_outputs_from_dict(outputs)
 
-        # HA mode returns lists, non-HA also returns lists (count=1)
+    def _parse_outputs_from_dict(self, outputs: dict) -> tuple:
+        """Parse instance_ids, public_ips, fqdn from terraform output dict."""
         instance_ids = outputs.get("instance_ids", [])
         public_ips   = outputs.get("public_ips", [])
         fqdn         = outputs.get("star_domain", "")
@@ -180,6 +231,32 @@ tags                = {tags_hcl}
             raise RuntimeError("terraform output 'public_ips' is empty")
 
         return instance_ids, public_ips, fqdn
+
+    def _extract_from_tfstate(self, state: dict) -> tuple:
+        """
+        Extract instance OCIDs and public IPs directly from tfstate JSON.
+        Handles both terraform 0.13+ (resources array) format.
+        """
+        instance_ids = []
+        public_ips   = []
+
+        resources = state.get("resources", [])
+        for resource in resources:
+            # Only look at OCI compute instances
+            if resource.get("type") != "oci_core_instance":
+                continue
+            for instance in resource.get("instances", []):
+                attrs = instance.get("attributes", {})
+                ocid  = attrs.get("id", "")
+                ip    = attrs.get("public_ip", "") or ""
+                if ocid:
+                    instance_ids.append(ocid)
+                if ip:
+                    public_ips.append(ip)
+
+        # Sort by display_name so node1/node2/node3 order is consistent
+        # tfstate doesn't guarantee order — zip by index after sorting
+        return instance_ids, public_ips
 
     def _run(self, cmd: list, label: str, capture: bool = False) -> subprocess.CompletedProcess:
         print(f"[TerraformManager] $ {' '.join(cmd)}")

@@ -1,6 +1,7 @@
 """Root conftest — CLI options, session fixtures, controller profile injection."""
 
 import os
+import re
 import pytest
 from utils.config_loader import load_controller_profile, load_config, load_package_profile
 
@@ -17,12 +18,25 @@ def pytest_addoption(parser):
     parser.addoption("--keep-vm",         action="store_true", default=False,
                      help="Skip terraform destroy after session")
     parser.addoption("--package-name",    default=None,   help="e.g. rafay-airgapped-controller-v3.1-39.tar.gz")
+    parser.addoption("--package-url",     default=None,   help="Full S3 URL for package (optional — auto-built for prod)")
     parser.addoption("--secondary-ips",   default=None,   help="Comma-separated IPs of secondary nodes e.g. 1.2.3.4,5.6.7.8")
     parser.addoption("--secondary-ids",   default=None,   help="Comma-separated OCI instance IDs of secondary nodes")
     parser.addoption("--controller-instance-id", default=None, help="OCI instance ID of primary node (for NSG in static IP mode)")
-    # ── NEW ───────────────────────────────────────────────────────────────────
     parser.addoption("--skip-bringup",    action="store_true", default=False,
                      help="Skip controller bringup — run validation tests only against existing install")
+    # ── Upgrade flags ──────────────────────────────────────────────────────────
+    parser.addoption("--src-package",     default=None,
+                     help="Source package e.g. rafay-airgapped-controller-v3.1-39.tar.gz")
+    parser.addoption("--dst-package",     default=None,
+                     help="Dest package e.g. rafay-airgapped-controller-v3.1-40.tar.gz")
+    parser.addoption("--dst-package-url", default=None,
+                     help="Full URL for dest package (optional — auto-built for prod)")
+    parser.addoption("--src-version",     default=None,
+                     help="Source version e.g. 3.1-39 (auto-extracted from src-package if not set)")
+    parser.addoption("--dst-version",     default=None,
+                     help="Dest version e.g. 3.1-40 (auto-extracted from dst-package if not set)")
+    parser.addoption("--skip-upgrade",    action="store_true", default=False,
+                     help="Skip upgrade — run validation only")
 
 
 @pytest.fixture(scope="session")
@@ -53,32 +67,15 @@ def controller_profile(request, raw_config):
 
 @pytest.fixture(scope="session")
 def ssh_client(request, raw_config, controller_profile):
-    """
-    Full VM lifecycle:
-
-    provision: true (dev.yaml):
-      1. Terraform apply  → OCI VM + 1TB data volume
-      2. boto3 Route53    → *.shc-{N}.dev.rafay-edge.net → VM IP
-      3. NSG attach       → internet access for apt + S3 download
-      4. SSH connect      → opens session
-
-    On teardown:
-      5. SSH disconnect
-      6. NSG safety detach
-      7. boto3 Route53    → delete DNS record
-      8. Terraform destroy → VM + data volume deleted
-    """
     from lib.ssh.ssh_client import SSHClient
 
     cli_ip    = request.config.getoption("--controller-ip")
     provision = raw_config.get("controller", {}).get("provision", False)
 
-    # ── Case 1: explicit CLI override ─────────────────────────────────────────
     if cli_ip:
         print(f"\n[ssh_client] Using --controller-ip: {cli_ip}")
         ip = cli_ip
 
-    # ── Case 2: provision via Terraform + boto3 DNS ───────────────────────────
     elif provision:
         from lib.oci.vm_manager import load_oci_profile, OCINSGManager
         from lib.terraform.tf_manager import TerraformManager
@@ -88,7 +85,6 @@ def ssh_client(request, raw_config, controller_profile):
         tf_manager  = TerraformManager(oci_profile)
         build_no    = request.config.getoption("--build-no") or os.environ.get("BUILD_NUMBER")
 
-        # Step 1: Terraform — create OCI VM(s) + data volume(s)
         print("\n[ssh_client] Provisioning VM(s) via Terraform ...")
         instance_ids, public_ips, _ = tf_manager.apply(
             build_no=build_no,
@@ -99,7 +95,6 @@ def ssh_client(request, raw_config, controller_profile):
         ip          = public_ips[0]
         print(f"[ssh_client] VM ready — id={instance_id}  ip={ip}")
 
-        # Step 2: boto3 Route53 — create DNS record
         dns_mgr = None
         fqdn    = ""
         if dns_cfg.get("hosted_zone_id"):
@@ -112,7 +107,6 @@ def ssh_client(request, raw_config, controller_profile):
         else:
             print(f"[ssh_client] No dns.hosted_zone_id in dev.yaml — skipping DNS")
 
-        # Step 3: NSG attach — internet access for apt + S3 download
         nsg_mgr = None
         if oci_profile.nsg_id:
             print(f"[ssh_client] Attaching NSG to primary node ...")
@@ -125,9 +119,7 @@ def ssh_client(request, raw_config, controller_profile):
                     print(f"[ssh_client] NSG attached to secondary node: {sec_id}")
                 except Exception as e:
                     print(f"[ssh_client] NSG attach warning for {sec_id}: {e}")
-            print(f"[ssh_client] NSG attached — all VMs have internet access")
 
-        # Store on session for fixtures and teardown
         request.session._tf_instance_id  = instance_id
         request.session._tf_instance_ids = instance_ids
         request.session._tf_public_ip    = ip
@@ -138,7 +130,6 @@ def ssh_client(request, raw_config, controller_profile):
         request.session._nsg_manager     = nsg_mgr
         request.session._keep_vm         = request.config.getoption("--keep-vm")
 
-    # ── Case 3: static IP ─────────────────────────────────────────────────────
     else:
         ip = controller_profile.ip
         if not ip:
@@ -148,7 +139,6 @@ def ssh_client(request, raw_config, controller_profile):
             )
         print(f"\n[ssh_client] Using static IP: {ip}")
 
-    # Step 4: Open SSH
     client = SSHClient(host=ip, user=controller_profile.user, key_path=controller_profile.ssh_key)
     client.connect()
     yield client
@@ -159,18 +149,14 @@ def ssh_client(request, raw_config, controller_profile):
     if provision and not cli_ip:
         nsg = getattr(request.session, "_nsg_manager", None)
         if nsg:
-            try:
-                nsg.detach()
-            except Exception as e:
-                print(f"[ssh_client] NSG detach warning: {e}")
+            try: nsg.detach()
+            except Exception as e: print(f"[ssh_client] NSG detach warning: {e}")
 
         dns = getattr(request.session, "_dns_manager", None)
         ip  = getattr(request.session, "_tf_public_ip", "")
         if dns and ip:
-            try:
-                dns.delete_record(ip)
-            except Exception as e:
-                print(f"[ssh_client] DNS delete warning: {e}")
+            try: dns.delete_record(ip)
+            except Exception as e: print(f"[ssh_client] DNS delete warning: {e}")
 
         tf   = getattr(request.session, "_tf_manager", None)
         keep = getattr(request.session, "_keep_vm", False)
@@ -197,26 +183,19 @@ def secondary_ips(request, raw_config):
 
 @pytest.fixture(scope="session")
 def secondary_instance_ids(request, raw_config):
-    # Priority 1 — CLI flag
     cli_ids = request.config.getoption("--secondary-ids", default=None)
     if cli_ids:
         return [i.strip() for i in cli_ids.split(",") if i.strip()]
 
-    # Priority 2 — dev.yaml secondary_ids
     yaml_ids = raw_config.get("controller", {}).get("secondary_ids", [])
     yaml_ids_clean = [i.strip() for i in (yaml_ids or []) if i and i.strip()]
     if yaml_ids_clean:
         return yaml_ids_clean
 
-    # Priority 3 — Terraform session output (provision: true)
     all_ids = getattr(request.session, "_tf_instance_ids", [])
     if len(all_ids) > 1:
         return all_ids[1:]
 
-    # Priority 4 — read_state() from existing tfstate (provision: false, VMs from TF)
-    # Handles case where VMs were created by Terraform but provision: false is set
-    # for iterative re-runs without re-provisioning.
-    # Falls back gracefully — returns [] if no tfstate found (no crash, NSG skipped)
     provision = raw_config.get("controller", {}).get("provision", False)
     if not provision:
         try:
@@ -226,10 +205,10 @@ def secondary_instance_ids(request, raw_config):
             tf_manager  = TerraformManager(oci_profile)
             all_ids, _, _ = tf_manager.read_state()
             if len(all_ids) > 1:
-                print(f"[secondary_instance_ids] read_state: found {len(all_ids)-1} secondary ID(s) from tfstate")
+                print(f"[secondary_instance_ids] read_state: found {len(all_ids)-1} secondary ID(s)")
                 return all_ids[1:]
         except Exception as e:
-            print(f"[secondary_instance_ids] read_state failed ({e}) — NSG will be skipped for secondary nodes")
+            print(f"[secondary_instance_ids] read_state failed ({e}) — NSG skipped for secondary nodes")
 
     return []
 
@@ -277,15 +256,29 @@ def controller_fqdn(request):
 
 @pytest.fixture(scope="session")
 def package_profile(request, raw_config):
+    # For upgrade runs — bringup uses src-package
+    # For bringup-only runs — uses package-name
+    package_name = (
+        request.config.getoption("--src-package")
+        or request.config.getoption("--package-name")
+    )
+    package_url = request.config.getoption("--package-url")
+
+    # If URL passed — extract name from URL automatically
+    if package_url and not package_name:
+        package_name = package_url.split("/")[-1]
+        print(f"[conftest] package name extracted from URL: {package_name}")
+
     profile = load_package_profile(
         cfg=raw_config,
-        package_name=request.config.getoption("--package-name"),
+        package_name=package_name,
+        package_url=package_url,
     )
     print(f"\n[conftest] {profile.summary()}")
     return profile
 
 
-# ── NEW: controller_bringup fixture ──────────────────────────────────────────
+# ── controller_bringup fixture ────────────────────────────────────────────────
 @pytest.fixture(scope="session", autouse=True)
 def controller_bringup(
     request,
@@ -299,26 +292,13 @@ def controller_bringup(
     nsg_manager,
     raw_config,
 ):
-    """
-    Runs full controller bringup ONCE per session before any test runs.
-    VM is already provisioned by ssh_client fixture above — this just
-    does the install (download, extract, radm phases).
-
-    Skip with --skip-bringup to re-run validation only against existing install:
-        pytest tests/ --skip-bringup --provision=false --controller-ip=<ip>
-
-    Normal Jenkins run:
-        pytest tests/ --controller-size=M --package-name=rafay-airgapped-controller-v3.1-39.tar.gz
-    """
     from lib.controller.bringup import ControllerBringup, BringupError
 
-    # --skip-bringup: validation only, no install steps
     if request.config.getoption("--skip-bringup"):
         print("[conftest] --skip-bringup — skipping install, running validation only")
         yield
         return
 
-    # Resolve star_domain from FQDN or build-no + base_domain
     if controller_fqdn:
         star_domain = controller_fqdn.lstrip("*.")
     else:
@@ -342,4 +322,67 @@ def controller_bringup(
     except BringupError as e:
         pytest.fail(f"Controller bringup failed at phase [{e.phase}]: {e}")
 
-    yield   # validation tests run after this point
+    yield
+
+
+# ── controller_upgrade fixture ────────────────────────────────────────────────
+@pytest.fixture(scope="session", autouse=True)
+def controller_upgrade(
+    request,
+    ssh_client,
+    controller_fqdn,
+    nsg_manager,
+    raw_config,
+    controller_bringup,   # ensures bringup runs first
+):
+    from lib.upgrade.upgrade_engine import UpgradeEngine
+
+    dst_package = request.config.getoption("--dst-package", default=None)
+    src_package = request.config.getoption("--src-package", default=None)
+
+    # Skip if no dst-package — bringup only run
+    if not dst_package:
+        print("[conftest] --dst-package not set — skipping upgrade")
+        yield
+        return
+
+    # Skip if --skip-upgrade
+    if request.config.getoption("--skip-upgrade"):
+        print("[conftest] --skip-upgrade — skipping upgrade")
+        yield
+        return
+
+    # Auto-extract versions from package names if not explicitly passed
+    def extract_version(pkg):
+        m = re.search(r'v([\d.]+-\d+)\.tar\.gz', pkg or "")
+        return m.group(1) if m else ""
+
+    src_version = request.config.getoption("--src-version") or extract_version(src_package)
+    dst_version = request.config.getoption("--dst-version") or extract_version(dst_package)
+
+    # Resolve star_domain
+    if controller_fqdn:
+        star_domain = controller_fqdn.lstrip("*.")
+    else:
+        base_domain  = raw_config.get("dns", {}).get("base_domain", "")
+        build_no_val = request.config.getoption("--build-no") or ""
+        star_domain  = f"shc-{build_no_val}.{base_domain}" if base_domain and build_no_val else ""
+
+    engine = UpgradeEngine(
+        ssh_client=ssh_client,
+        src_version=src_version,
+        dst_version=dst_version,
+        src_package=src_package or "",
+        dst_package=dst_package,
+        dst_package_url=request.config.getoption("--dst-package-url") or "",
+        install_dir=raw_config.get("package", {}).get("install_dir", "/opt/rafay"),
+        star_domain=star_domain,
+        nsg_manager=nsg_manager,
+    )
+
+    try:
+        engine.run()
+    except Exception as e:
+        pytest.fail(f"Controller upgrade failed: {e}")
+
+    yield
