@@ -7,7 +7,7 @@ the result based on controller_size, HA mode, and OS type from the profile.
 
 import pytest
 
-pytestmark = [pytest.mark.controller, pytest.mark.regression]
+pytestmark = [pytest.mark.order(1), pytest.mark.controller, pytest.mark.regression]
 
 
 def attach_output(extras, label: str, content: str):

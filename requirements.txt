@@ -11,6 +11,6 @@ oci==2.130.0
 # Config / utilities
 pyyaml==6.0.1
 python-dotenv==1.0.1
-
+pytest-ordering
 # kubectl wrapper
 # (uses subprocess — no extra install needed)

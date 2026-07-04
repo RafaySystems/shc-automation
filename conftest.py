@@ -386,3 +386,11 @@ def controller_upgrade(
         pytest.fail(f"Controller upgrade failed: {e}")
 
     yield
+
+@pytest.fixture
+def extras(extra):
+    """
+    pytest-html extras fixture — attach HTML/images/text to test report.
+    Works with both old (extra) and new (extras) pytest-html APIs.
+    """
+    return extra
