@@ -1,20 +1,20 @@
 console:
   email: admin@rafay.co
-  mfa_secret: CL2VUMOOFQCVZ6WI
+  mfa_secret: 
   partner_id: "4qkolkn"
-  password: change123
+  password: 
   test_org:
     name: "onprem-qa"
     email: "onprem@rafay.co"
-    password: "changeplz"
+    password: ""
     first_name: "onprem"
     last_name: "qa"
 controller:
   controller_size: S
   ha: true
-  ip: 129.146.22.64
+  ip: 
   os_type: ubuntu24
-  provision: false
+  provision: true
   secondary_ips: []
   ssh_key: /Users/vijay/Documents/rafay-pytest-framework/keys/oci.key
   user: ubuntu
