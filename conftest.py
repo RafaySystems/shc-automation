@@ -3,8 +3,12 @@
 import os
 import re
 import pytest
-from utils.config_loader import load_controller_profile, load_config, load_package_profile
-from utils.s3_config import download_rauto_config_from_s3  # adjust import path if module lives elsewhere
+from utils.config_loader import (
+    load_controller_profile,
+    load_config,
+    load_package_profile,
+    download_rauto_config_from_s3,
+)
 
 
 def pytest_addoption(parser):
@@ -52,9 +56,10 @@ def rauto_config_from_s3():
     ${RAUTO_AWS_SSH_KEY}, instead of hardcoding an absolute local path.
     """
     paths = download_rauto_config_from_s3()
-    os.environ["RAUTO_OCI_SSH_KEY"] = paths["ocipem"]
-    os.environ["RAUTO_AWS_SSH_KEY"] = paths["awspem"]
-    print(f"[conftest] SSH keys ready — oci={paths['ocipem']}  aws={paths['awspem']}")
+    os.environ["RAUTO_OCI_SSH_KEY"]        = paths["ocipem"]   # private key — used by SSHClient to connect
+    os.environ["RAUTO_OCI_SSH_PUBLIC_KEY"] = paths["ocipub"]   # public key  — used by Terraform/cloud-init at VM creation
+    os.environ["RAUTO_AWS_SSH_KEY"]        = paths["awspem"]
+    print(f"[conftest] SSH keys ready — oci={paths['ocipem']}  oci_pub={paths['ocipub']}  aws={paths['awspem']}")
     yield paths
 
 
@@ -75,6 +80,7 @@ def controller_profile(request, raw_config, rauto_config_from_s3):
         env=request.config.getoption("--env"),
         controller_ip=request.config.getoption("--controller-ip"),
         ssh_key=request.config.getoption("--ssh-key") or os.environ.get("RAUTO_OCI_SSH_KEY"),
+        ssh_public_key=os.environ.get("RAUTO_OCI_SSH_PUBLIC_KEY"),
         ssh_user=request.config.getoption("--ssh-user"),
         controller_size=request.config.getoption("--controller-size"),
         ha=ha_override,

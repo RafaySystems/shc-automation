@@ -1,9 +1,10 @@
 """Load and validate YAML config, providing a typed ControllerProfile."""
 
 import os
+import subprocess
 import yaml
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -25,6 +26,7 @@ class ControllerProfile:
     controller_size: str   # S | M | L
     ha: bool               # True = HA, False = single node
     os_type: str           # ubuntu24 | rhel8 | rhel9
+    ssh_public_key: str = ""   # used by Terraform/cloud-init to authorize the VM at creation time
 
     def __post_init__(self):
         # Validate size
@@ -47,8 +49,10 @@ class ControllerProfile:
                 f"Size '{self.controller_size}' does not support {mode} mode. "
                 f"Size S = Non-HA only | Size M = both | Size L = HA only."
             )
-        # Expand ~ in ssh_key path
-        self.ssh_key = str(Path(self.ssh_key).expanduser())
+        # Expand ~ and any ${ENV_VAR} references in key paths
+        self.ssh_key = str(Path(os.path.expandvars(self.ssh_key)).expanduser())
+        if self.ssh_public_key:
+            self.ssh_public_key = str(Path(os.path.expandvars(self.ssh_public_key)).expanduser())
 
     @property
     def mode_label(self) -> str:
@@ -86,6 +90,7 @@ def load_controller_profile(
     # CLI overrides — any of these can be passed directly from conftest.py
     controller_ip: Optional[str] = None,
     ssh_key: Optional[str] = None,
+    ssh_public_key: Optional[str] = None,
     ssh_user: Optional[str] = None,
     controller_size: Optional[str] = None,
     ha: Optional[bool] = None,
@@ -120,10 +125,84 @@ def load_controller_profile(
         ip=resolve(controller_ip, "CONTROLLER_IP", ctrl["ip"]),
         user=resolve(ssh_user, "CONTROLLER_USER", ctrl.get("user", "ubuntu")),
         ssh_key=resolve(ssh_key, "CONTROLLER_SSH_KEY", ctrl["ssh_key"]),
+        ssh_public_key=resolve(
+            ssh_public_key, "CONTROLLER_SSH_PUBLIC_KEY", ctrl.get("ssh_public_key", "")
+        ),
         controller_size=resolve(controller_size, "CONTROLLER_SIZE", ctrl.get("controller_size", "S")),
         ha=resolved_ha,
         os_type=resolve(os_type, "CONTROLLER_OS_TYPE", ctrl.get("os_type", "ubuntu24")),
     )
+
+
+# ── S3 config/keys download ──────────────────────────────────────────────────
+
+def copy_bucket_from_s3(s3_uri: str, dest_dir: str) -> None:
+    """
+    Recursively download every object under an S3 URI into dest_dir,
+    preserving the key structure below the bucket name.
+
+    Example:
+        copy_bucket_from_s3('s3://qa-automation-rauto-configurations', '/path/to/rauto-config/')
+    """
+    import boto3
+
+    assert s3_uri.startswith("s3://"), f"Not an S3 URI: {s3_uri}"
+    bucket_name = s3_uri[len("s3://"):].split("/")[0]
+    prefix = "/".join(s3_uri[len("s3://"):].split("/")[1:])
+
+    os.makedirs(dest_dir, exist_ok=True)
+    s3 = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith("/"):
+                continue  # skip "directory" placeholder objects
+            rel_path = key[len(prefix):].lstrip("/")
+            local_path = os.path.join(dest_dir, rel_path)
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            s3.download_file(bucket_name, key, local_path)
+            print(f"[config_loader] downloaded s3://{bucket_name}/{key} -> {local_path}")
+
+
+def download_rauto_config_from_s3() -> dict:
+    """
+    Pulls SSH keys and infra config from S3 into a local rauto-config/ directory.
+
+    Called once per test session (see conftest.py's rauto_config_from_s3 fixture)
+    before any controller_profile/ssh_client fixtures need the key material.
+
+    Returns:
+        dict with keys: awspem, ocipem, ocipub (all absolute local file paths)
+    """
+    top_dir = os.path.join(os.path.dirname(__file__), "../../")
+    app_dir = os.path.join(top_dir, "rauto-config/")
+    print(f"Downloading Configurations from S3 to {app_dir}")
+    copy_bucket_from_s3("s3://qa-automation-rauto-configurations", app_dir)
+
+    awspem = os.path.join(top_dir, "rauto-config/infra_config/awstest.pem")
+    ocipem = os.path.join(top_dir, "rauto-config/infra_config/oci_key")
+    ocipub = ocipem + ".pub"
+
+    os.chmod(ocipem, 0o600)
+    os.chmod(awspem, 0o600)
+
+    # Derive the public key from the private key if the bucket didn't include one
+    if not os.path.exists(ocipub):
+        result = subprocess.run(
+            ["ssh-keygen", "-y", "-f", ocipem],
+            capture_output=True, text=True, check=True,
+        )
+        with open(ocipub, "w") as f:
+            f.write(result.stdout)
+        print(f"[config_loader] derived public key from private key -> {ocipub}")
+
+    return {
+        "awspem": os.path.abspath(awspem),
+        "ocipem": os.path.abspath(ocipem),
+        "ocipub": os.path.abspath(ocipub),
+    }
 
 
 # ── OCI profile helpers ───────────────────────────────────────────────────────
@@ -255,13 +334,19 @@ class PackageProfile:
         )
 
 
-def load_package_profile(cfg: dict, package_name: Optional[str] = None) -> PackageProfile:
+def load_package_profile(cfg: dict, package_name: Optional[str] = None,
+                          package_url: Optional[str] = None) -> PackageProfile:
     """
     Build a PackageProfile from the 'package:' section of dev.yaml.
 
-    Priority: CLI --package-name arg > env var > dev.yaml value.
+    Priority: CLI --package-url > CLI --package-name > env var > dev.yaml value.
+    If package_url is provided, name is extracted from URL automatically.
     """
     pkg_cfg = cfg.get("package", {})
+
+    # If URL provided, extract name from it
+    if package_url and not package_name:
+        package_name = package_url.split("/")[-1]
 
     name = (
         package_name
@@ -275,8 +360,11 @@ def load_package_profile(cfg: dict, package_name: Optional[str] = None) -> Packa
             "Example: rafay-airgapped-controller-v3.1-39.tar.gz"
         )
 
+    # URL priority: CLI --package-url > dev.yaml url > auto-derived from name
+    url = package_url or pkg_cfg.get("url", "")
+
     return PackageProfile(
         name=name,
         install_dir=pkg_cfg.get("install_dir", "/opt/rafay"),
-        url=pkg_cfg.get("url", ""),
+        url=url,
     )
