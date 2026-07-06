@@ -1058,6 +1058,8 @@ class TestRadmInstall:
         Step 4: kubectl get nodes — verify all nodes Ready
         Step 5: wait for pods Running
         """
+        from lib.ssh.ssh_client import SSHClient
+
         # Resolve actual extract dir — _actual_extract_dir may not be set
         # when running a single test in isolation (different session)
         extract_dir = getattr(package_profile, "_actual_extract_dir", None)
@@ -1182,14 +1184,27 @@ class TestRadmInstall:
 
             pending = []
             for i, sec_ip in enumerate(secondary_ips, 2):
-                # Query the node's own hostname to match against kubectl's NAME column —
-                # avoids relying on IP-based matching, which kubectl's output doesn't expose.
-                hostname_out, _ = ssh_client.run(
-                    f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-                    f"-i {controller_profile.ssh_key} {controller_profile.user}@{sec_ip} "
-                    f"hostname 2>/dev/null"
-                )
-                sec_hostname = hostname_out.strip()
+                # Connect DIRECTLY to the secondary node to read its hostname —
+                # must use a fresh SSHClient here, not ssh_client.run() (which
+                # executes on node1 and has no access to the local key file
+                # controller_profile.ssh_key points to on the Jenkins container).
+                sec_hostname = ""
+                try:
+                    hostname_check_ssh = SSHClient(
+                        host=sec_ip,
+                        user=controller_profile.user,
+                        key_path=controller_profile.ssh_key
+                    )
+                    hostname_check_ssh.connect()
+                    try:
+                        hostname_out, _ = hostname_check_ssh.run("hostname")
+                        sec_hostname = hostname_out.strip()
+                    finally:
+                        hostname_check_ssh.disconnect()
+                except Exception as e:
+                    print(f"[test_radm_init_completes] Could not check node{i} ({sec_ip}) "
+                          f"hostname — will attempt join: {e}")
+
                 if sec_hostname and sec_hostname in already_joined_hostnames:
                     print(f"[test_radm_init_completes] node{i} ({sec_ip}, {sec_hostname}) "
                           f"already a cluster member — skipping join")
@@ -1235,7 +1250,6 @@ class TestRadmInstall:
                 )
                 attach_output(extras, "radm join command", join_cmd)
 
-                from lib.ssh.ssh_client import SSHClient
                 for i, sec_ip in pending:
                     print(f"[test_radm_init_completes] Joining node{i} ({sec_ip}) ...")
                     sec_ssh = SSHClient(
