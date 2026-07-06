@@ -1,20 +1,21 @@
 console:
   email: admin@rafay.co
-  mfa_secret: 
-  partner_id: "4qkolkn"
-  password: 
+  mfa_secret: 75WHXPLUJFTNOIWO
+  partner_id: 4qkolkn
+  password: change123
   test_org:
-    name: "onprem-qa"
-    email: "onprem@rafay.co"
-    password: ""
-    first_name: "onprem"
-    last_name: "qa"
+    email: onprem@rafay.co
+    first_name: onprem
+    last_name: qa
+    name: onprem-qa
+    password: changeplz
 controller:
   controller_size: S
   ha: true
-  ip: 
+  ip: 158.101.3.18
+  ssh_key: "${RAUTO_OCI_SSH_KEY}"
   os_type: ubuntu24
-  provision: true
+  provision: false
   secondary_ips: []
   ssh_key: /Users/vijay/Documents/rafay-pytest-framework/keys/oci.key
   user: ubuntu
@@ -28,6 +29,7 @@ kubectl:
   kubeconfig_path: ~/.kube/config
 oci:
   availability_domain: PaOl:PHX-AD-1
+  ssh_public_key: "${RAUTO_OCI_SSH_PUBLIC_KEY}"
   boot_timeout: 300
   boot_volume_gb: 1100
   compartment_id: ocid1.compartment.oc1..aaaaaaaadbipnkdi7rrn6ksl3ar64cn27uu2wd63ek7w7nx7e3fnk5n5omiq
