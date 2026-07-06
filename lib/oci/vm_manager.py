@@ -40,8 +40,10 @@ class OCIProfile:
     ha: bool = False               # HA mode — 3 nodes when True
 
     def __post_init__(self):
-        self.config_file    = str(Path(self.config_file).expanduser())
-        self.ssh_public_key = str(Path(self.ssh_public_key).expanduser())
+        # os.path.expandvars resolves ${RAUTO_OCI_SSH_PUBLIC_KEY}-style
+        # placeholders in dev.yaml before ~ expansion.
+        self.config_file    = str(Path(os.path.expandvars(self.config_file)).expanduser())
+        self.ssh_public_key = str(Path(os.path.expandvars(self.ssh_public_key)).expanduser())
 
     def resolve_display_name(self, build_no: Optional[str] = None) -> str:
         if build_no:
@@ -94,6 +96,15 @@ def load_oci_profile(cfg: dict, build_no: Optional[str] = None) -> OCIProfile:
     def resolve(yaml_val, env_var):
         return os.environ.get(env_var, yaml_val)
 
+    # ssh_public_key: check RAUTO_OCI_SSH_PUBLIC_KEY (set by Jenkins
+    # credentials at pipeline runtime) first, then fall back to the
+    # OCI-namespaced override, then finally dev.yaml's own value.
+    resolved_ssh_public_key = (
+        os.environ.get("RAUTO_OCI_SSH_PUBLIC_KEY")
+        or os.environ.get("OCI_SSH_PUBLIC_KEY")
+        or oci_cfg["ssh_public_key"]
+    )
+
     return OCIProfile(
         config_file=resolve(oci_cfg.get("config_file", "~/.oci/config"), "OCI_CONFIG_FILE"),
         profile=resolve(oci_cfg.get("profile", "DEFAULT"), "OCI_PROFILE"),
@@ -108,7 +119,7 @@ def load_oci_profile(cfg: dict, build_no: Optional[str] = None) -> OCIProfile:
         memory_gb=float(resolve(oci_cfg.get("memory_gb", 64), "OCI_MEMORY_GB")),
         boot_volume_gb=int(resolve(oci_cfg.get("boot_volume_gb", 500), "OCI_BOOT_VOLUME_GB")),
         data_volume_gb=int(resolve(oci_cfg.get("data_volume_gb", 1024), "OCI_DATA_VOLUME_GB")),
-        ssh_public_key=resolve(oci_cfg["ssh_public_key"], "OCI_SSH_PUBLIC_KEY"),
+        ssh_public_key=resolved_ssh_public_key,
         display_name=resolve(oci_cfg.get("display_name", "rafay-controller"), "OCI_DISPLAY_NAME"),
         ha=bool(cfg.get("controller", {}).get("ha", False)),
         tags=oci_cfg.get("tags") or {},
