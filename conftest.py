@@ -7,7 +7,6 @@ from utils.config_loader import (
     load_controller_profile,
     load_config,
     load_package_profile,
-    download_rauto_config_from_s3,
 )
 
 
@@ -44,34 +43,15 @@ def pytest_addoption(parser):
                      help="Skip upgrade — run validation only")
 
 
-# ── S3 config/keys fixture ──────────────────────────────────────────────────────
-@pytest.fixture(scope="session", autouse=True)
-def rauto_config_from_s3():
-    """
-    Pulls SSH keys and other infra config from S3 once per test session,
-    before any fixture that needs oci_key / awstest.pem runs.
-
-    Exposes the downloaded key paths via environment variables so dev.yaml
-    (or any config file) can reference them with ${RAUTO_OCI_SSH_KEY} /
-    ${RAUTO_AWS_SSH_KEY}, instead of hardcoding an absolute local path.
-    """
-    paths = download_rauto_config_from_s3()
-    os.environ["RAUTO_OCI_SSH_KEY"]        = paths["ocipem"]   # private key — used by SSHClient to connect
-    os.environ["RAUTO_OCI_SSH_PUBLIC_KEY"] = paths["ocipub"]   # public key  — used by Terraform/cloud-init at VM creation
-    os.environ["RAUTO_AWS_SSH_KEY"]        = paths["awspem"]
-    print(f"[conftest] SSH keys ready — oci={paths['ocipem']}  oci_pub={paths['ocipub']}  aws={paths['awspem']}")
-    yield paths
-
-
 @pytest.fixture(scope="session")
-def raw_config(request, rauto_config_from_s3):
+def raw_config(request):
     cfg = load_config(request.config.getoption("--env"))
     request.session._raw_config = cfg
     return cfg
 
 
 @pytest.fixture(scope="session")
-def controller_profile(request, raw_config, rauto_config_from_s3):
+def controller_profile(request, raw_config):
     ha_raw = request.config.getoption("--ha")
     ha_override = None
     if ha_raw is not None:

@@ -1,7 +1,6 @@
 """Load and validate YAML config, providing a typed ControllerProfile."""
 
 import os
-import subprocess
 import yaml
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -132,77 +131,6 @@ def load_controller_profile(
         ha=resolved_ha,
         os_type=resolve(os_type, "CONTROLLER_OS_TYPE", ctrl.get("os_type", "ubuntu24")),
     )
-
-
-# ── S3 config/keys download ──────────────────────────────────────────────────
-
-def copy_bucket_from_s3(s3_uri: str, dest_dir: str) -> None:
-    """
-    Recursively download every object under an S3 URI into dest_dir,
-    preserving the key structure below the bucket name.
-
-    Example:
-        copy_bucket_from_s3('s3://qa-automation-rauto-configurations', '/path/to/rauto-config/')
-    """
-    import boto3
-
-    assert s3_uri.startswith("s3://"), f"Not an S3 URI: {s3_uri}"
-    bucket_name = s3_uri[len("s3://"):].split("/")[0]
-    prefix = "/".join(s3_uri[len("s3://"):].split("/")[1:])
-
-    os.makedirs(dest_dir, exist_ok=True)
-    s3 = boto3.client("s3")
-    paginator = s3.get_paginator("list_objects_v2")
-
-    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith("/"):
-                continue  # skip "directory" placeholder objects
-            rel_path = key[len(prefix):].lstrip("/")
-            local_path = os.path.join(dest_dir, rel_path)
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            s3.download_file(bucket_name, key, local_path)
-            print(f"[config_loader] downloaded s3://{bucket_name}/{key} -> {local_path}")
-
-
-def download_rauto_config_from_s3() -> dict:
-    """
-    Pulls SSH keys and infra config from S3 into a local rauto-config/ directory.
-
-    Called once per test session (see conftest.py's rauto_config_from_s3 fixture)
-    before any controller_profile/ssh_client fixtures need the key material.
-
-    Returns:
-        dict with keys: awspem, ocipem, ocipub (all absolute local file paths)
-    """
-    top_dir = os.path.join(os.path.dirname(__file__), "../../")
-    app_dir = os.path.join(top_dir, "rauto-config/")
-    print(f"Downloading Configurations from S3 to {app_dir}")
-    copy_bucket_from_s3("s3://qa-automation-rauto-configurations", app_dir)
-
-    awspem = os.path.join(top_dir, "rauto-config/infra_config/awstest.pem")
-    ocipem = os.path.join(top_dir, "rauto-config/infra_config/oci_key")
-    ocipub = ocipem + ".pub"
-
-    os.chmod(ocipem, 0o600)
-    os.chmod(awspem, 0o600)
-
-    # Derive the public key from the private key if the bucket didn't include one
-    if not os.path.exists(ocipub):
-        result = subprocess.run(
-            ["ssh-keygen", "-y", "-f", ocipem],
-            capture_output=True, text=True, check=True,
-        )
-        with open(ocipub, "w") as f:
-            f.write(result.stdout)
-        print(f"[config_loader] derived public key from private key -> {ocipub}")
-
-    return {
-        "awspem": os.path.abspath(awspem),
-        "ocipem": os.path.abspath(ocipem),
-        "ocipub": os.path.abspath(ocipub),
-    }
 
 
 # ── OCI profile helpers ───────────────────────────────────────────────────────
