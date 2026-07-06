@@ -13,6 +13,8 @@ from utils.config_loader import (
 def pytest_addoption(parser):
     parser.addoption("--env",             default="dev",  help="Config env: dev | staging")
     parser.addoption("--controller-ip",   default=None,   help="Override controller IP (skips provisioning)")
+    parser.addoption("--provision",       action="store_true", default=False,
+                     help="Force fresh VM provisioning via Terraform, overriding dev.yaml's controller.provision value")
     parser.addoption("--ssh-key",         default=None,   help="Path to SSH private key (.pem)")
     parser.addoption("--ssh-user",        default=None,   help="SSH username (default: ubuntu)")
     parser.addoption("--controller-size", default=None,   help="S | M | L")
@@ -80,7 +82,10 @@ def ssh_client(request, raw_config, controller_profile):
     from lib.ssh.ssh_client import SSHClient
 
     cli_ip    = request.config.getoption("--controller-ip")
-    provision = raw_config.get("controller", {}).get("provision", False)
+    provision = (
+        request.config.getoption("--provision")
+        or raw_config.get("controller", {}).get("provision", False)
+    )
 
     if cli_ip:
         print(f"\n[ssh_client] Using --controller-ip: {cli_ip}")
