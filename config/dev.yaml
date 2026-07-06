@@ -20,7 +20,7 @@ controller:
   ssh_key: /Users/vijay/Documents/rafay-pytest-framework/keys/oci.key
   user: ubuntu
 dns:
-  aws_profile: vijay-aws
+  aws_profile: 
   base_domain: dev.rafay-edge.net
   hosted_zone_id: Z1OM749F0P8E4R
   ttl: 60
