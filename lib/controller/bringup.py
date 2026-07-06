@@ -344,7 +344,52 @@ class ControllerBringup:
             _, rc = self.ssh.run(f"sudo sed -i 's|star-domain: STAR_PLACEHOLDER|star-domain: {self.star_domain}|' {config_path}")
             assert rc == 0
 
+        # ── Signed cert (opt-in, everything above is completely unchanged) ────
+        if getattr(self, "use_signed_cert", False):
+            self._patch_signed_cert(config_path)
+
         print(f"[create_config_yaml] Patched: size={size} ha={ha} domain={self.star_domain} ✓")
+
+    def _patch_signed_cert(self, config_path: str):
+        """
+        Replaces the controller's self-signed cert with a Let's Encrypt
+        wildcard cert issued via Route53 DNS-01 (lib/certs/cert_manager.py).
+
+        Only called when use_signed_cert=True. Does not touch config.yaml
+        at all otherwise — self-signed behavior is fully preserved.
+        """
+        from lib.certs.cert_manager import generate_signed_cert, CertGenerationError
+
+        assert self.star_domain, "star_domain is required to issue a signed cert"
+
+        try:
+            cert_b64, key_b64 = generate_signed_cert(
+                star_domain=self.star_domain,
+                email=self.cert_email,
+            )
+        except CertGenerationError as e:
+            raise Exception(f"Signed cert generation failed: {e}") from e
+
+        q = '"'
+
+        # generate-self-signed-certs: false
+        _, rc = self.ssh.run(
+            f"sudo sed -i '/^[ ]*generate-self-signed-certs:/s|:.*|: false|' {config_path}"
+        )
+        assert rc == 0
+
+        # certificate: "<base64 fullchain>"
+        self.ssh.run(f"sudo sed -i '/^[ ]*certificate:/s|:.*|: CERT_PLACEHOLDER|' {config_path}")
+        _, rc = self.ssh.run(f"sudo sed -i 's|CERT_PLACEHOLDER|{q}{cert_b64}{q}|' {config_path}")
+        assert rc == 0
+
+        # key: "<base64 privkey>"
+        self.ssh.run(f"sudo sed -i '/^[ ]*key:/s|:.*|: KEY_PLACEHOLDER|' {config_path}")
+        _, rc = self.ssh.run(f"sudo sed -i 's|KEY_PLACEHOLDER|{q}{key_b64}{q}|' {config_path}")
+        assert rc == 0
+
+        print(f"[create_config_yaml] Signed cert installed for *.{self.star_domain} ✓ "
+              f"(generate-self-signed-certs=false)")
 
     def _setup_secondary_nodes(self):
         """HA: full setup on node2 + node3 (download, extract, config.yaml copy)."""

@@ -43,6 +43,10 @@ def pytest_addoption(parser):
                      help="Dest version e.g. 3.1-40 (auto-extracted from dst-package if not set)")
     parser.addoption("--skip-upgrade",    action="store_true", default=False,
                      help="Skip upgrade — run validation only")
+    # ── Signed cert (Let's Encrypt via Route53 DNS-01) ────────────────────────
+    parser.addoption("--signed-cert",     action="store_true", default=False,
+                     help="Issue a Let's Encrypt wildcard cert via Route53 DNS-01 "
+                          "instead of the controller's self-signed default")
 
 
 @pytest.fixture(scope="session")
@@ -330,6 +334,8 @@ def controller_bringup(
         secondary_instance_ids=secondary_instance_ids,
         oci_profile=oci_profile_fixture,
         nsg_manager=nsg_manager,
+        use_signed_cert=request.config.getoption("--signed-cert"),
+        cert_email=raw_config.get("certs", {}).get("email", ""),
     )
 
     try:
