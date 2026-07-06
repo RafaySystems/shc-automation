@@ -1054,6 +1054,7 @@ class TestRadmInstall:
                 sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
                 sudo chown $(id -u):$(id -g) -R $HOME/.kube
         Step 3: HA only — build join command from kubeadm token, run on node2+node3
+                (skips any secondary node that's already a cluster member)
         Step 4: kubectl get nodes — verify all nodes Ready
         Step 5: wait for pods Running
         """
@@ -1168,58 +1169,90 @@ class TestRadmInstall:
 
         # ── Step 3: HA — radm join on node2 and node3 ────────────────────────
         if controller_profile.ha and secondary_ips:
-            print(f"[test_radm_init_completes] Step 3: HA mode — joining {len(secondary_ips)} secondary nodes ...")
+            print(f"[test_radm_init_completes] Step 3: HA mode — checking {len(secondary_ips)} secondary node(s) ...")
 
-            # Build join command from kubeadm token on node1
-            token_out, _ = ssh_client.run(
-                "kubeadm token list 2>/dev/null | grep -v TOKEN | head -1 | awk '{print $1}'"
-            )
-            ca_hash_out, _ = ssh_client.run(
-                "openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | "
-                "openssl rsa -pubin -outform der 2>/dev/null | "
-                "openssl dgst -sha256 -hex | sed 's/^.* //'"
-            )
-            primary_ip_out, _ = ssh_client.run(
-                "hostname -I | awk '{print $1}'"
-            )
-            token   = token_out.strip()
-            ca_hash = ca_hash_out.strip()
-            pri_ip  = primary_ip_out.strip()
+            # Which secondary nodes are already cluster members? Match by
+            # hostname substring against `kubectl get nodes` output captured
+            # just above — same signal Step 1 uses for node1's init check.
+            already_joined_hostnames = set()
+            for line in kubectl_out.splitlines():
+                parts = line.split()
+                if parts and parts[0] not in ("NAME",):
+                    already_joined_hostnames.add(parts[0])
 
-            assert token,   "Could not get kubeadm token — did radm init complete?"
-            assert ca_hash, "Could not get CA hash"
-            assert pri_ip,  "Could not get primary node IP"
-
-            print(f"[test_radm_init_completes] token  : {token}")
-            print(f"[test_radm_init_completes] pri_ip : {pri_ip}")
-
-            join_cmd = (
-                f"cd {extract_dir} && "
-                f"sudo ./radm join {pri_ip}:6443 "
-                f"--token {token} "
-                f"--discovery-token-ca-cert-hash sha256:{ca_hash} "
-                f"--config config.yaml"
-            )
-            attach_output(extras, "radm join command", join_cmd)
-
-            from lib.ssh.ssh_client import SSHClient
+            pending = []
             for i, sec_ip in enumerate(secondary_ips, 2):
-                print(f"[test_radm_init_completes] Joining node{i} ({sec_ip}) ...")
-                sec_ssh = SSHClient(
-                    host=sec_ip,
-                    user=controller_profile.user,
-                    key_path=controller_profile.ssh_key
+                # Query the node's own hostname to match against kubectl's NAME column —
+                # avoids relying on IP-based matching, which kubectl's output doesn't expose.
+                hostname_out, _ = ssh_client.run(
+                    f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+                    f"-i {controller_profile.ssh_key} {controller_profile.user}@{sec_ip} "
+                    f"hostname 2>/dev/null"
                 )
-                sec_ssh.connect()
-                try:
-                    join_out, join_rc = sec_ssh.run(join_cmd, timeout=1800)
-                    attach_output(extras, f"radm join node{i} ({sec_ip})", join_out)
-                    assert join_rc == 0, (
-                        f"radm join failed on node{i} ({sec_ip}) exit {join_rc}:\n{join_out}"
+                sec_hostname = hostname_out.strip()
+                if sec_hostname and sec_hostname in already_joined_hostnames:
+                    print(f"[test_radm_init_completes] node{i} ({sec_ip}, {sec_hostname}) "
+                          f"already a cluster member — skipping join")
+                    attach_output(extras, f"node{i} join status", "Already joined — skipped")
+                else:
+                    pending.append((i, sec_ip))
+
+            if not pending:
+                print("[test_radm_init_completes] All secondary nodes already joined — skipping join step entirely")
+            else:
+                print(f"[test_radm_init_completes] Joining {len(pending)} pending node(s): "
+                      f"{[ip for _, ip in pending]}")
+
+                # Build join command from kubeadm token on node1
+                token_out, _ = ssh_client.run(
+                    "kubeadm token list 2>/dev/null | grep -v TOKEN | head -1 | awk '{print $1}'"
+                )
+                ca_hash_out, _ = ssh_client.run(
+                    "openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | "
+                    "openssl rsa -pubin -outform der 2>/dev/null | "
+                    "openssl dgst -sha256 -hex | sed 's/^.* //'"
+                )
+                primary_ip_out, _ = ssh_client.run(
+                    "hostname -I | awk '{print $1}'"
+                )
+                token   = token_out.strip()
+                ca_hash = ca_hash_out.strip()
+                pri_ip  = primary_ip_out.strip()
+
+                assert token,   "Could not get kubeadm token — did radm init complete?"
+                assert ca_hash, "Could not get CA hash"
+                assert pri_ip,  "Could not get primary node IP"
+
+                print(f"[test_radm_init_completes] token  : {token}")
+                print(f"[test_radm_init_completes] pri_ip : {pri_ip}")
+
+                join_cmd = (
+                    f"cd {extract_dir} && "
+                    f"sudo ./radm join {pri_ip}:6443 "
+                    f"--token {token} "
+                    f"--discovery-token-ca-cert-hash sha256:{ca_hash} "
+                    f"--config config.yaml"
+                )
+                attach_output(extras, "radm join command", join_cmd)
+
+                from lib.ssh.ssh_client import SSHClient
+                for i, sec_ip in pending:
+                    print(f"[test_radm_init_completes] Joining node{i} ({sec_ip}) ...")
+                    sec_ssh = SSHClient(
+                        host=sec_ip,
+                        user=controller_profile.user,
+                        key_path=controller_profile.ssh_key
                     )
-                    print(f"[test_radm_init_completes] node{i} ({sec_ip}) joined successfully")
-                finally:
-                    sec_ssh.disconnect()
+                    sec_ssh.connect()
+                    try:
+                        join_out, join_rc = sec_ssh.run(join_cmd, timeout=1800)
+                        attach_output(extras, f"radm join node{i} ({sec_ip})", join_out)
+                        assert join_rc == 0, (
+                            f"radm join failed on node{i} ({sec_ip}) exit {join_rc}:\n{join_out}"
+                        )
+                        print(f"[test_radm_init_completes] node{i} ({sec_ip}) joined successfully")
+                    finally:
+                        sec_ssh.disconnect()
 
             # ── Step 4: verify all nodes Ready ────────────────────────────────
             print("[test_radm_init_completes] Step 4: verifying all nodes Ready ...")
