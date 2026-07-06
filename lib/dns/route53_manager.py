@@ -2,7 +2,10 @@
 lib/dns/route53_manager.py
 
 Manages Route53 DNS records using boto3.
-Uses aws_profile from dev.yaml dns.aws_profile — same profile used by AWS CLI.
+Uses aws_profile from dev.yaml dns.aws_profile when set — same profile used
+by AWS CLI locally. In CI, leave dns.aws_profile unset/blank so boto3 falls
+back to its default credential chain (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+env vars, which Jenkins injects via withCredentials).
 
 Flow:
     create_record(ip)  → *.shc-42.dev.rafay-edge.net → <VM IP>
@@ -30,12 +33,25 @@ class Route53Manager:
         self.hosted_zone_id = dns_cfg.get("hosted_zone_id", "")
         self.base_domain    = dns_cfg.get("base_domain", "dev.rafay-edge.net")
         self.ttl            = int(dns_cfg.get("ttl", 60))
-        self.aws_profile    = dns_cfg.get("aws_profile", "default")
+        # No default here — an unset/blank profile means "use boto3's normal
+        # credential chain" (env vars, instance role, or the SDK's own
+        # default profile), rather than forcing a lookup of a named profile
+        # that may not exist on this machine.
+        self.aws_profile    = dns_cfg.get("aws_profile") or None
         self.display_name   = display_name
         self.record_name    = f"*.{display_name}.{self.base_domain}"
 
-        # Use the profile from dev.yaml — same as AWS CLI vijay-aws
-        session = boto3.Session(profile_name=self.aws_profile)
+        # Only pass profile_name when one is explicitly configured (e.g. for
+        # local runs using a named AWS CLI profile). In CI, this stays None
+        # and boto3 picks up AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from
+        # the environment automatically.
+        if self.aws_profile:
+            print(f"[Route53Manager] Using AWS profile: {self.aws_profile}")
+            session = boto3.Session(profile_name=self.aws_profile)
+        else:
+            print("[Route53Manager] No aws_profile set — using default boto3 credential chain")
+            session = boto3.Session()
+
         self.client = session.client("route53")
 
     def create_record(self, ip: str):

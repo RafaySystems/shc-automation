@@ -12,10 +12,10 @@ console:
 controller:
   controller_size: S
   ha: true
-  ip: 158.101.3.18
+  ip: 
   ssh_key: "${RAUTO_OCI_SSH_KEY}"
   os_type: ubuntu24
-  provision: false
+  provision: true
   secondary_ips: []
   ssh_key: /Users/vijay/Documents/rafay-pytest-framework/keys/oci.key
   user: ubuntu
