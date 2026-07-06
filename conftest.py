@@ -56,16 +56,21 @@ def controller_profile(request, raw_config):
     ha_override = None
     if ha_raw is not None:
         ha_override = ha_raw.lower() in ("true", "1", "yes")
+
+    env_pubkey = os.environ.get("RAUTO_OCI_SSH_PUBLIC_KEY")
+    print(f"[conftest] RAUTO_OCI_SSH_PUBLIC_KEY from env = {env_pubkey!r}")
+
     profile = load_controller_profile(
         env=request.config.getoption("--env"),
         controller_ip=request.config.getoption("--controller-ip"),
         ssh_key=request.config.getoption("--ssh-key") or os.environ.get("RAUTO_OCI_SSH_KEY"),
-        ssh_public_key=os.environ.get("RAUTO_OCI_SSH_PUBLIC_KEY"),
+        ssh_public_key=env_pubkey,
         ssh_user=request.config.getoption("--ssh-user"),
         controller_size=request.config.getoption("--controller-size"),
         ha=ha_override,
         os_type=request.config.getoption("--os-type"),
     )
+    print(f"[conftest] Resolved profile.ssh_public_key = {profile.ssh_public_key!r}")
     print(f"\n[conftest] {profile.summary()}")
     return profile
 
