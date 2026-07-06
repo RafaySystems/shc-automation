@@ -31,7 +31,6 @@ class CertGenerationError(Exception):
 def generate_signed_cert(
     star_domain: str,
     email: str,
-    propagation_seconds: int = 30,
     config_dir: str = "/tmp/letsencrypt/config",
     work_dir: str = "/tmp/letsencrypt/work",
     logs_dir: str = "/tmp/letsencrypt/logs",
@@ -57,7 +56,6 @@ def generate_signed_cert(
         "--agree-tos",
         "-m", email,
         "--dns-route53",
-        "--dns-route53-propagation-seconds", str(propagation_seconds),
         "-d", domain_arg,
         "--config-dir", config_dir,
         "--work-dir", work_dir,
