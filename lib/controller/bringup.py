@@ -14,6 +14,7 @@ Flow:
     7.  extract_package()      — tar -xf to /opt/rafay
     8.  copy_radm_binary()     — cp radm /usr/bin/
     9.  create_config_yaml()   — patch size/ha/type/archive-dir/star-domain
+                                 (+ signed cert, if use_signed_cert=True)
     10. setup_secondary_nodes()— HA only: repeat steps 3-9 on node2+node3
     11. radm_init()            — radm init + kubeconfig + HA join
                                  → polls node Ready every 30s for 5 min
@@ -27,6 +28,8 @@ Flow:
 Jenkins params:
     --controller-size   S | M | L | POC
     --package-name      rafay-airgapped-controller-v3.1-39.tar.gz
+    --signed-cert       issue a Let's Encrypt wildcard cert via Route53 DNS-01
+                        instead of the controller's self-signed default
 """
 
 import time
@@ -64,6 +67,8 @@ class ControllerBringup:
             secondary_ips=["10.0.0.2", "10.0.0.3"],   # HA only
             secondary_instance_ids=["ocid1...", "ocid1..."],
             oci_profile=oci_profile,
+            use_signed_cert=True,          # opt-in — see --signed-cert CLI flag
+            cert_email="admin@rafay.co",
         )
         bringup.run()
 
@@ -81,6 +86,8 @@ class ControllerBringup:
         secondary_instance_ids:  Optional[List[str]] = None,
         oci_profile=None,
         nsg_manager=None,
+        use_signed_cert:         bool = False,
+        cert_email:              str = "",
     ):
         self.ssh             = ssh_client
         self.profile         = controller_profile
@@ -90,6 +97,8 @@ class ControllerBringup:
         self.secondary_ids   = secondary_instance_ids or []
         self.oci_profile     = oci_profile
         self.nsg             = nsg_manager
+        self.use_signed_cert = use_signed_cert
+        self.cert_email      = cert_email
         self.extract_dir     = None   # set after extraction
 
     # ── Public entry point ────────────────────────────────────────────────────
@@ -106,6 +115,7 @@ class ControllerBringup:
         print(f"[bringup]   os      : {self.profile.os_type}")
         print(f"[bringup]   package : {self.pkg.name}")
         print(f"[bringup]   domain  : {self.star_domain or 'not set'}")
+        print(f"[bringup]   cert    : {'signed (Lets Encrypt)' if self.use_signed_cert else 'self-signed'}")
         print("═" * 60 + "\n")
 
         self._phase("setup_install_dir",    self._setup_install_dir)
@@ -345,51 +355,10 @@ class ControllerBringup:
             assert rc == 0
 
         # ── Signed cert (opt-in, everything above is completely unchanged) ────
-        if getattr(self, "use_signed_cert", False):
+        if self.use_signed_cert:
             self._patch_signed_cert(config_path)
 
         print(f"[create_config_yaml] Patched: size={size} ha={ha} domain={self.star_domain} ✓")
-
-    def _patch_signed_cert(self, config_path: str):
-        """
-        Replaces the controller's self-signed cert with a Let's Encrypt
-        wildcard cert issued via Route53 DNS-01 (lib/certs/cert_manager.py).
-
-        Only called when use_signed_cert=True. Does not touch config.yaml
-        at all otherwise — self-signed behavior is fully preserved.
-        """
-        from lib.certs.cert_manager import generate_signed_cert, CertGenerationError
-
-        assert self.star_domain, "star_domain is required to issue a signed cert"
-
-        try:
-            cert_b64, key_b64 = generate_signed_cert(
-                star_domain=self.star_domain,
-                email=self.cert_email,
-            )
-        except CertGenerationError as e:
-            raise Exception(f"Signed cert generation failed: {e}") from e
-
-        q = '"'
-
-        # generate-self-signed-certs: false
-        _, rc = self.ssh.run(
-            f"sudo sed -i '/^[ ]*generate-self-signed-certs:/s|:.*|: false|' {config_path}"
-        )
-        assert rc == 0
-
-        # certificate: "<base64 fullchain>"
-        self.ssh.run(f"sudo sed -i '/^[ ]*certificate:/s|:.*|: CERT_PLACEHOLDER|' {config_path}")
-        _, rc = self.ssh.run(f"sudo sed -i 's|CERT_PLACEHOLDER|{q}{cert_b64}{q}|' {config_path}")
-        assert rc == 0
-
-        # key: "<base64 privkey>"
-        self.ssh.run(f"sudo sed -i '/^[ ]*key:/s|:.*|: KEY_PLACEHOLDER|' {config_path}")
-        _, rc = self.ssh.run(f"sudo sed -i 's|KEY_PLACEHOLDER|{q}{key_b64}{q}|' {config_path}")
-        assert rc == 0
-
-        print(f"[create_config_yaml] Signed cert installed for *.{self.star_domain} ✓ "
-              f"(generate-self-signed-certs=false)")
 
     def _patch_signed_cert(self, config_path: str):
         """
