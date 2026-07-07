@@ -49,8 +49,19 @@ class TestControllerHealth:
         assert not not_ready, f"Nodes not ready:\n" + "\n".join(not_ready)
 
     def test_controller_profile_summary(self, controller_profile):
-        """Smoke-check that controller_profile loaded correctly from config."""
+        """
+        Smoke-check that controller_profile loaded correctly from config.
+
+        controller_profile.ip is only populated in static-IP mode (--controller-ip
+        passed, or controller.provision: false in dev.yaml). In --provision mode
+        (fresh Terraform VM), the IP isn't known until after apply — it lives on
+        request.session._tf_public_ip instead, set later in the ssh_client fixture.
+        So profile.ip being None here is the expected, correct state for that mode,
+        not a bug — the summary should show "IP=None" and that's fine. Only assert
+        the IP appears in the summary when the profile actually carries one.
+        """
         s = controller_profile.summary()
-        assert controller_profile.ip in s
+        if controller_profile.ip:
+            assert controller_profile.ip in s
         assert controller_profile.controller_size in s
         assert controller_profile.os_type in s
