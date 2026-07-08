@@ -297,12 +297,16 @@ class TestConsoleLogin:
         if result.screenshot:
             attach_screenshot(extras, "ops-console dashboard screenshot", result.screenshot)
 
-        if result.success and result.secret and not mfa_secret:
+        if result.success and result.secret and result.secret != mfa_secret:
             _save_secret_to_config(
                 request.config.getoption("--env", default="dev"),
                 result.secret
             )
-            attach_output(extras, "TOTP secret", "Saved to dev.yaml")
+            # Stash on the session too — raw_config is session-scoped and was
+            # already loaded from disk, so a later test in this same run would
+            # otherwise keep reading the stale value even after the YAML write.
+            request.session._fresh_mfa_secret = result.secret
+            attach_output(extras, "TOTP secret", "Saved to dev.yaml (fresh secret)")
 
         assert result.success, f"Login failed: {result.error}"
         attach_output(extras, "Dashboard URL", result.url)
@@ -372,7 +376,12 @@ class TestOrgAndUser:
         # Need authenticated session for signup API
         admin_email    = console_cfg.get("email",    "admin@rafay.co")
         admin_password = console_cfg.get("password", "change123")
-        admin_secret   = console_cfg.get("mfa_secret") or ""
+        # Prefer the secret refreshed earlier this session (handles the
+        # controller-re-provisioned / fresh-QR-scan case) over the
+        # session-cached raw_config value, which may now be stale even
+        # though dev.yaml on disk was updated.
+        admin_secret   = getattr(request.session, "_fresh_mfa_secret", None) \
+                          or console_cfg.get("mfa_secret") or ""
 
         csrftoken, session = _get_authenticated_session(
             ops_url, admin_email, admin_password, admin_secret
