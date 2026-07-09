@@ -19,10 +19,13 @@ Flow:
     11. radm_init()            — radm init + kubeconfig + HA join
                                  → polls node Ready every 30s for 5 min
     12. radm_dependency()      — radm dependency
+                                 → command timeout 1800s (30 min)
                                  → polls pods every 20s for 20 min
     13. radm_application()     — radm application
+                                 → command timeout 2400s (40 min)
                                  → polls pods every 20s for 35 min
     14. radm_cluster()         — radm cluster (streaming output, 3-retry on 502)
+                                 → command timeout 2400s (40 min)
                                  → polls pods every 20s for 15 min
 
 Jenkins params:
@@ -39,6 +42,10 @@ from typing import Optional, List
 
 
 # ── Retry wait policies per phase ─────────────────────────────────────────────
+# NOTE: these govern the POST-command pod-polling step only. The command
+# timeouts themselves (how long `radm dependency`/`application`/`cluster`
+# are allowed to run before ssh_client.run() raises TimeoutError) are set
+# individually in each phase method below.
 PHASE_WAIT = {
     "radm_init":        {"interval": 30, "max_wait": 300,   "label": "nodes Ready"},
     "radm_dependency":  {"interval": 20, "max_wait": 1200,  "label": "pods Running"},
@@ -594,10 +601,20 @@ class ControllerBringup:
             print(f"[ha_join] node{i} ({sec_ip}) joined ✓")
 
     def _radm_dependency(self):
+        """
+        Run: sudo ./radm dependency --config config.yaml
+
+        Installs cert-manager, istio, and elasticsearch (rafay-es) via Helm.
+        Command timeout is 1800s (30 min) -- matches radm_init's timeout, since
+        this phase does comparable Helm-install work and 10 minutes proved too
+        tight under normal OCI resource contention / image pull latency (a run
+        was observed still actively creating Helm resources for istio-services
+        and rafay-es when a previous 600s timeout fired mid-apply).
+        """
         print("[radm_dependency] Running radm dependency ...")
         out, rc = self.ssh.run(
             f"cd {self.extract_dir} && sudo ./radm dependency --config config.yaml 2>&1",
-            timeout=600,
+            timeout=1800,
         )
         assert rc == 0, f"radm dependency failed (exit {rc}): {out[-300:]}"
         print("[radm_dependency] complete ✓ — polling pods ...")
