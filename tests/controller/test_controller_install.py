@@ -912,6 +912,45 @@ class TestPackageSetup:
 class TestRadmInstall:
     """Drive the radm installation steps sequentially."""
 
+    # Class-level cache for the "cluster already fully applied" check.
+    # Computed once (by whichever of dependency/application/cluster runs
+    # first), then reused by the other two so we don't repeat the same
+    # kubectl query three times in a row.
+    _cluster_healthy = None
+
+    def _check_cluster_already_healthy(self, ssh_client, extras):
+        """
+        Check once whether all pods are already Running/Completed.
+
+        controller_bringup (the autouse fixture) already runs radm
+        dependency/application/cluster once during the actual bringup.
+        Re-running any of these against an already-applied, live cluster
+        can hang on stale Jobs, or — for `radm cluster` specifically —
+        re-extract and re-upload the entire image/asset registry (327
+        images + 1203 assets in a typical run) while the cluster is
+        serving traffic. That's what previously crashed
+        calico-kube-controllers, csi-provisioner, and redis-replicas into
+        CrashLoopBackOff.
+
+        So: if every pod is already Running/Completed, treat the whole
+        dependency -> application -> cluster sequence as done and skip
+        re-running any of the three. Result is cached on the class so this
+        kubectl query only runs once per test session, not once per test.
+        """
+        if TestRadmInstall._cluster_healthy is not None:
+            return TestRadmInstall._cluster_healthy
+
+        pods_out, pods_rc = ssh_client.run("kubectl get pods -A --no-headers 2>/dev/null")
+        lines = [l for l in pods_out.splitlines() if l.strip()]
+        not_ready = [l for l in lines if "Running" not in l and "Completed" not in l]
+        healthy = pods_rc == 0 and bool(lines) and not not_ready
+
+        attach_output(extras, "pre-check pod status",
+                      f"total={len(lines)} not_ready={len(not_ready)}")
+
+        TestRadmInstall._cluster_healthy = healthy
+        return healthy
+
     def _wait_for_pods(self, ssh_client, extras, label="pods", max_wait=1500,
                        fail_on_timeout=False):
         """
@@ -1285,29 +1324,11 @@ class TestRadmInstall:
             getattr(package_profile, '_actual_extract_dir', None)
             or '/opt/rafay/rafay-airgapped-controller-v3.1-39'
         )
- 
-        # controller_bringup (autouse fixture) already ran radm dependency once
-        # during the actual bringup. Re-running it here against an already-applied
-        # cluster can hang or conflict on existing Job resources (e.g. Kubernetes
-        # Jobs that already reached a terminal state don't get "re-triggered" by
-        # radm reconciling them again). Check the cluster's current pod count
-        # first — ~124 pods is the known-good count after a successful
-        # radm dependency run — and skip the re-run if it's already there.
-        total_out, _ = ssh_client.run("kubectl get pods -A --no-headers 2>/dev/null | wc -l")
-        not_ready_out, _ = ssh_client.run(
-            "kubectl get pods -A --no-headers 2>/dev/null | grep -v 'Running\\|Completed' | wc -l"
-        )
-        total = int((total_out or "0").strip() or 0)
-        not_ready = int((not_ready_out or "0").strip() or 0)
-        already_healthy = total >= 100 and not_ready == 0
- 
-        attach_output(extras, "pre-check pod count", f"total={total} not_ready={not_ready}")
- 
-        if already_healthy:
-            print(f"[test_radm_dependency_completes] Cluster already healthy "
-                  f"({total} pods, 0 not-ready) — skipping radm dependency re-run")
-            attach_output(extras, "radm dependency status",
-                           "Already applied — skipped re-run")
+
+        if self._check_cluster_already_healthy(ssh_client, extras):
+            print("[test_radm_dependency_completes] Cluster already healthy "
+                  "(all pods Running/Completed) — skipping radm dependency re-run")
+            attach_output(extras, "radm dependency status", "Already applied — skipped re-run")
         else:
             out, rc = ssh_client.run(
                 f"cd {extract_dir} && sudo ./radm dependency --config config.yaml 2>&1",
@@ -1315,35 +1336,21 @@ class TestRadmInstall:
             )
             attach_output(extras, "radm dependency output", out)
             assert rc == 0, f"radm dependency failed (exit {rc}). See output above."
- 
+            print("[test_radm_dependency_completes] radm dependency passed ✓")
+
         self._wait_for_pods(ssh_client, extras, label="after radm dependency")
- 
+
     def test_radm_application_completes(self, ssh_client, package_profile, extras):
         """Run: sudo radm application --config config.yaml (~20-30 min)"""
         extract_dir = (
             getattr(package_profile, '_actual_extract_dir', None)
             or '/opt/rafay/rafay-airgapped-controller-v3.1-39'
         )
- 
-        # Same reasoning as test_radm_dependency_completes above — controller_bringup
-        # already ran radm application once. ~278 pods is the known-good count after
-        # a successful radm application run (vs ~124 after dependency alone), so use
-        # that higher threshold to avoid mistaking a dependency-only state for done.
-        total_out, _ = ssh_client.run("kubectl get pods -A --no-headers 2>/dev/null | wc -l")
-        not_ready_out, _ = ssh_client.run(
-            "kubectl get pods -A --no-headers 2>/dev/null | grep -v 'Running\\|Completed' | wc -l"
-        )
-        total = int((total_out or "0").strip() or 0)
-        not_ready = int((not_ready_out or "0").strip() or 0)
-        already_healthy = total >= 200 and not_ready == 0
- 
-        attach_output(extras, "pre-check pod count", f"total={total} not_ready={not_ready}")
- 
-        if already_healthy:
-            print(f"[test_radm_application_completes] Cluster already healthy "
-                  f"({total} pods, 0 not-ready) — skipping radm application re-run")
-            attach_output(extras, "radm application status",
-                           "Already applied — skipped re-run")
+
+        if self._check_cluster_already_healthy(ssh_client, extras):
+            print("[test_radm_application_completes] Cluster already healthy "
+                  "(all pods Running/Completed) — skipping radm application re-run")
+            attach_output(extras, "radm application status", "Already applied — skipped re-run")
         else:
             out, rc = ssh_client.run(
                 f"cd {extract_dir} && sudo ./radm application --config config.yaml 2>&1",
@@ -1351,41 +1358,22 @@ class TestRadmInstall:
             )
             attach_output(extras, "radm application output", out)
             assert rc == 0, f"radm application failed (exit {rc}). See output above."
- 
+            print("[test_radm_application_completes] radm application passed ✓")
+
         self._wait_for_pods(ssh_client, extras, label="after radm application",
                             max_wait=2400, fail_on_timeout=True)
+
     def test_radm_cluster_completes(self, ssh_client, package_profile, extras):
         """Run: sudo radm cluster --config config.yaml"""
         extract_dir = (
             getattr(package_profile, '_actual_extract_dir', None)
             or '/opt/rafay/rafay-airgapped-controller-v3.1-39'
         )
- 
-        # controller_bringup (autouse fixture) already ran radm cluster once —
-        # it uploads the full image/asset registry (327 images + 1203 assets in
-        # a typical run) and stands up the cluster blueprint. Re-running it here
-        # against an already-applied cluster re-extracts and re-uploads that
-        # entire registry while the cluster is live, which is what previously
-        # crashed rafay-core-harbor-core, redis-replicas, and
-        # calico-kube-controllers into CrashLoopBackOff. ~279-280 pods is the
-        # known-good count after a successful radm cluster run — skip the
-        # re-run if the cluster is already there, same pattern as
-        # test_radm_dependency_completes / test_radm_application_completes above.
-        total_out, _ = ssh_client.run("kubectl get pods -A --no-headers 2>/dev/null | wc -l")
-        not_ready_out, _ = ssh_client.run(
-            "kubectl get pods -A --no-headers 2>/dev/null | grep -v 'Running\\|Completed' | wc -l"
-        )
-        total = int((total_out or "0").strip() or 0)
-        not_ready = int((not_ready_out or "0").strip() or 0)
-        already_healthy = total >= 270 and not_ready == 0
- 
-        attach_output(extras, "pre-check pod count", f"total={total} not_ready={not_ready}")
- 
-        if already_healthy:
-            print(f"[test_radm_cluster_completes] Cluster already healthy "
-                  f"({total} pods, 0 not-ready) — skipping radm cluster re-run")
-            attach_output(extras, "radm cluster status",
-                           "Already applied — skipped re-run")
+
+        if self._check_cluster_already_healthy(ssh_client, extras):
+            print("[test_radm_cluster_completes] Cluster already healthy "
+                  "(all pods Running/Completed) — skipping radm cluster re-run")
+            attach_output(extras, "radm cluster status", "Already applied — skipped re-run")
         else:
             out, rc = ssh_client.run(
                 f"cd {extract_dir} && sudo ./radm cluster --config config.yaml 2>&1",
@@ -1393,7 +1381,8 @@ class TestRadmInstall:
             )
             attach_output(extras, "radm cluster output", out)
             assert rc == 0, f"radm cluster failed (exit {rc}). See output above."
- 
+            print("[test_radm_cluster_completes] radm cluster passed ✓")
+
         self._wait_for_pods(ssh_client, extras, label="after radm cluster",
                             max_wait=1200, fail_on_timeout=True)
 
