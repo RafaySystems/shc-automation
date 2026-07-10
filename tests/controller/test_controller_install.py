@@ -13,6 +13,9 @@ pytestmark = [pytest.mark.order(1), pytest.mark.controller, pytest.mark.regressi
 def attach_output(extras, label: str, content: str):
     """Embed command output into the pytest-html report.
     Supports both pytest-html 3.x (extra) and 4.x (extras).
+    Also mirrors the same content to the Allure report (if allure is
+    importable), so results are visible in whichever report is open
+    without needing to SSH to the Jenkins node.
     """
     import pytest_html
     block = f"<pre style='font-size:12px;white-space:pre-wrap'>{content}</pre>"
@@ -21,6 +24,78 @@ def attach_output(extras, label: str, content: str):
         extras.append(item)
     else:
         extras.extend([item])
+
+    try:
+        import allure
+        allure.attach(content, name=label, attachment_type=allure.attachment_type.TEXT)
+    except Exception:
+        # Allure not installed / not active in this run -- pytest-html
+        # attachment above still succeeded, so don't fail the test over this.
+        pass
+
+
+def attach_pod_logs(ssh_client, extras, bad_lines, tail=200):
+    """
+    For every pod line that isn't Running/Completed, pull logs for each of
+    its containers (regular + init containers) and attach them to the
+    report -- so a Jenkins node SSH isn't needed to see why a pod is
+    unhealthy.
+
+    For each container this attaches:
+      - current logs   (kubectl logs --tail=N)              -- what the
+        container is doing/printing right now
+      - previous logs  (kubectl logs --previous --tail=N)    -- what the
+        PRIOR instance printed before it crashed/restarted. This is
+        usually where the actual crash reason lives for a CrashLoopBackOff
+        pod, since the current instance may have just restarted seconds
+        ago and printed almost nothing yet.
+
+    Deliberately does NOT use `kubectl logs -f` -- that follows the stream
+    and never returns on its own, which would hang the test until the SSH
+    command's own timeout killed it (and likely return no usable output).
+    A bounded `--tail=N` snapshot is what we actually want here.
+
+    `bad_lines` should be lines from `kubectl get pods -A --no-headers`
+    output (NAMESPACE POD_NAME ... columns), same format the callers of
+    this function already have on hand.
+    """
+    for pod_line in bad_lines:
+        parts = pod_line.split()
+        if len(parts) < 2:
+            continue
+        ns, pod_name = parts[0], parts[1]
+
+        # Discover containers -- regular + init containers -- so multi-
+        # container pods (e.g. sidecars) don't get skipped.
+        containers_out, _ = ssh_client.run(
+            f"kubectl get pod {pod_name} -n {ns} "
+            f"-o jsonpath='{{.spec.containers[*].name}} {{.spec.initContainers[*].name}}' "
+            f"2>/dev/null"
+        )
+        containers = [c for c in containers_out.split() if c]
+        if not containers:
+            containers = [""]  # fall back to kubectl's default container
+
+        for container in containers:
+            c_flag = f"-c {container}" if container else ""
+            label  = f"{ns}/{pod_name}" + (f" [{container}]" if container else "")
+
+            logs_out, _ = ssh_client.run(
+                f"kubectl logs {pod_name} -n {ns} {c_flag} --tail={tail} 2>&1"
+            )
+            attach_output(extras, f"logs: {label}", logs_out)
+
+            prev_out, prev_rc = ssh_client.run(
+                f"kubectl logs {pod_name} -n {ns} {c_flag} --previous --tail={tail} 2>&1"
+            )
+            # Only attach "previous" if it actually returned something --
+            # kubectl errors out here if the container has never restarted,
+            # and that error text isn't useful to attach.
+            if prev_rc == 0 and prev_out.strip():
+                attach_output(extras, f"logs (previous instance): {label}", prev_out)
+
+            print(f"[attach_pod_logs] {label}: attached current"
+                  f"{' + previous' if (prev_rc == 0 and prev_out.strip()) else ''} logs")
 
 
 class TestPreflightChecks:
@@ -918,9 +993,29 @@ class TestRadmInstall:
     # kubectl query three times in a row.
     _cluster_healthy = None
 
+    # Pods observed to flap into CrashLoopBackOff/Error independently of
+    # whether radm dependency/application/cluster have actually been
+    # applied (recurring across builds -- e.g. build 52, build 54, always
+    # the same three). A pod matching one of these patterns should not be
+    # read as "install step not yet run" -- treating it that way is what
+    # triggered a real re-run of radm dependency/application/cluster against
+    # an already-applied cluster in build 52 (exit-1 / 2400s+1200s timeouts,
+    # plus it made the instability worse).
+    #
+    # This exclusion ONLY affects the re-run guard below. It does NOT affect
+    # TestPostInstallHealth / TestClusterState / TestEndToEnd / smoke tests --
+    # those still check every pod strictly and will correctly flag these as
+    # unhealthy if they're still crash-looping by the time they run.
+    KNOWN_FLAKY_POD_PATTERNS = (
+        "calico-kube-controllers",
+        "csi-provisioner",
+        "redis-replicas",
+    )
+
     def _check_cluster_already_healthy(self, ssh_client, extras):
         """
-        Check once whether all pods are already Running/Completed.
+        Check once whether all pods -- excluding KNOWN_FLAKY_POD_PATTERNS --
+        are already Running/Completed.
 
         controller_bringup (the autouse fixture) already runs radm
         dependency/application/cluster once during the actual bringup.
@@ -930,23 +1025,40 @@ class TestRadmInstall:
         images + 1203 assets in a typical run) while the cluster is
         serving traffic. That's what previously crashed
         calico-kube-controllers, csi-provisioner, and redis-replicas into
-        CrashLoopBackOff.
+        CrashLoopBackOff in the first place -- so treating those same three
+        pods as a reason to re-run just perpetuates the problem.
 
-        So: if every pod is already Running/Completed, treat the whole
-        dependency -> application -> cluster sequence as done and skip
-        re-running any of the three. Result is cached on the class so this
-        kubectl query only runs once per test session, not once per test.
+        So: if every pod except the known-flaky ones is already
+        Running/Completed, treat the whole dependency -> application ->
+        cluster sequence as done and skip re-running any of the three.
+        Result is cached on the class so this kubectl query only runs once
+        per test session, not once per test.
         """
         if TestRadmInstall._cluster_healthy is not None:
             return TestRadmInstall._cluster_healthy
 
         pods_out, pods_rc = ssh_client.run("kubectl get pods -A --no-headers 2>/dev/null")
-        lines = [l for l in pods_out.splitlines() if l.strip()]
-        not_ready = [l for l in lines if "Running" not in l and "Completed" not in l]
-        healthy = pods_rc == 0 and bool(lines) and not not_ready
+        lines     = [l for l in pods_out.splitlines() if l.strip()]
+        not_ready = [
+            l for l in lines
+            if "Running" not in l and "Completed" not in l
+            and not any(p in l for p in TestRadmInstall.KNOWN_FLAKY_POD_PATTERNS)
+        ]
+        excluded  = [
+            l for l in lines
+            if "Running" not in l and "Completed" not in l
+            and any(p in l for p in TestRadmInstall.KNOWN_FLAKY_POD_PATTERNS)
+        ]
+        healthy   = pods_rc == 0 and bool(lines) and not not_ready
 
         attach_output(extras, "pre-check pod status",
-                      f"total={len(lines)} not_ready={len(not_ready)}")
+                      f"total={len(lines)} not_ready(excl. known-flaky)={len(not_ready)} "
+                      f"known_flaky_excluded={len(excluded)}")
+        if excluded:
+            attach_output(extras, "known-flaky pods excluded from re-run guard",
+                          "\n".join(excluded))
+            print(f"[_check_cluster_already_healthy] Excluding {len(excluded)} known-flaky "
+                  f"pod(s) from re-run decision: {[l.split()[1] for l in excluded if len(l.split()) > 1]}")
 
         TestRadmInstall._cluster_healthy = healthy
         return healthy
@@ -1037,6 +1149,12 @@ class TestRadmInstall:
                 )
                 attach_output(extras, f"describe {ns}/{pod_name}", desc_out)
                 print(f"[{label}] describe {ns}/{pod_name}:\n{desc_out[-300:]}")
+
+        # Pull logs (current + previous instance, per container) for every
+        # unhealthy pod -- not just the first 5 -- so the crash reason is
+        # visible in the report without SSHing to the Jenkins node.
+        if not_ready:
+            attach_pod_logs(ssh_client, extras, not_ready)
 
         # Always continue — do not fail
         print(f"[{label}] Continuing despite unready pods ...")
@@ -1397,6 +1515,11 @@ class TestPostInstallHealth:
         assert rc == 0, "kubectl get pods failed -- is kubeconfig set up?"
         bad = [l for l in out.splitlines()
                if any(s in l for s in ("Pending", "Error", "CrashLoop", "Init:", "OOMKilled"))]
+        if bad:
+            # Attach logs (current + previous instance, per container) for
+            # every unhealthy pod so the crash reason is visible in the
+            # report without SSHing to the Jenkins node.
+            attach_pod_logs(ssh_client, extras, bad)
         assert not bad, f"{len(bad)} unhealthy pod(s):\n" + "\n".join(bad)
 
     def test_ha_master_node_count(self, ssh_client, controller_profile, extras):
