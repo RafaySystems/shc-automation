@@ -2,25 +2,31 @@
 lib/upgrade/upgrade_engine.py
 
 Written ONCE — never changes when new versions are added.
-No hooks file needed — commands live directly in upgrade_registry.py.
+Per-hop commands live in lib/upgrade/hops/hop_<from>_to_<to>_upgrade.py --
+see that package's __init__.py for get_hop() / the hook naming convention.
 
-Phases per hop:
-  1. pre_commands       — version-specific shell commands (warn on failure)
-  2. download           — new package via aria2c
-  3. extract            — new package via pigz/tar
-  4. create_config      — copy template, patch fields from old config
-  5. copy_radm          — new radm → /usr/bin/
-  6. radm dependency    — always same
-  7. wait elasticsearch — wait for green
-  8. radm application   — always same
-  9. radm cluster old   — from source package dir
-  10. post_commands     — version-specific shell commands (warn on failure)
-  11. radm cluster new  — from dest package dir
+Phases per hop, in the order they actually run:
+  1.  pre_commands             — version-specific shell commands (warn on failure)
+  2.  download                 — new package via aria2c
+  3.  extract                  — new package via pigz/tar
+  4.  create_config            — copy template, patch fields from old config
+  5.  copy_radm                — new radm → /usr/bin/
+  6.  radm dependency          — always same
+      after_radm_dependency    — version-specific shell commands (warn on failure)
+  7.  wait elasticsearch       — wait for green
+  8.  radm application         — always same
+      after_radm_application   — version-specific shell commands (warn on failure)
+  9.  radm cluster old         — from source package dir
+  10. post_commands            — version-specific shell commands (warn on failure)
+                                  (runs after the OLD cluster, before the NEW one --
+                                  same meaning as before, unchanged)
+  11. radm cluster new         — from dest package dir
+      after_radm_cluster       — version-specific shell commands (warn on failure)
 """
 
 import re
 import time
-from lib.upgrade.upgrade_registry import get_hop
+from lib.upgrade.hops import get_hop
 
 # ── Wait policies ─────────────────────────────────────────────────────────────
 PHASE_WAIT = {
@@ -82,17 +88,23 @@ class UpgradeEngine:
         self._phase("create_upgrade_config", self._create_upgrade_config)
         self._phase("copy_new_radm",         self._copy_new_radm)
 
-        # 3. radm phases (fatal on failure)
-        self._phase("radm_dependency",    self._radm_dependency)
-        self._phase("wait_elasticsearch", self._wait_elasticsearch)
-        self._phase("radm_application",   self._radm_application)
-        self._phase("radm_cluster_old",   self._radm_cluster_old)
+        # 3. radm dependency, then its hook (fatal phase, warn-only hook)
+        self._phase("radm_dependency", self._radm_dependency)
+        self._run_commands("after_radm_dependency", hop.get("after_radm_dependency", []))
 
-        # 4. Post-commands (warn on failure)
+        self._phase("wait_elasticsearch", self._wait_elasticsearch)
+
+        # 4. radm application, then its hook (fatal phase, warn-only hook)
+        self._phase("radm_application", self._radm_application)
+        self._run_commands("after_radm_application", hop.get("after_radm_application", []))
+
+        # 5. Old cluster, then post_commands (unchanged meaning: old→new boundary)
+        self._phase("radm_cluster_old", self._radm_cluster_old)
         self._run_commands("post", hop.get("post_commands", []))
 
-        # 5. Final radm cluster (fatal on failure)
+        # 6. Final radm cluster (new version), then its hook
         self._phase("radm_cluster_new", self._radm_cluster_new)
+        self._run_commands("after_radm_cluster", hop.get("after_radm_cluster", []))
 
         print("\n" + "═" * 60)
         print(f"[upgrade] ✅ Upgrade complete: {self.src_version} → {self.dst_version}")
@@ -111,7 +123,7 @@ class UpgradeEngine:
 
     def _run_commands(self, cmd_type: str, commands: list):
         """
-        Run pre or post shell commands.
+        Run pre/post/after_radm_* shell commands for this hop.
         Warns on failure — never stops the upgrade.
         Commands ending with || true never fail by design.
         """
@@ -225,10 +237,19 @@ class UpgradeEngine:
         print("[copy_new_radm] new radm → /usr/bin/radm ✓")
 
     def _radm_dependency(self):
+        """
+        Run: sudo ./radm dependency --config config.yaml
+
+        Command timeout is 1800s (30 min), not 600s -- 10 minutes proved too
+        tight under normal OCI resource contention / image pull latency (see
+        the same fix in lib/controller/bringup.py's _radm_dependency: a run
+        was observed still actively creating Helm resources when a 600s
+        timeout fired mid-apply).
+        """
         print("[radm_dependency] Running ...")
         out, rc = self.ssh.run(
             f"cd {self.dst_extract_dir} && sudo ./radm dependency --config config.yaml 2>&1",
-            timeout=600,
+            timeout=1800,
         )
         assert rc == 0, f"radm dependency failed (exit {rc}): {out[-300:]}"
         self._poll_pods(PHASE_WAIT["radm_dependency"], "after radm dependency")
