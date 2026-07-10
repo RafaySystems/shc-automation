@@ -351,6 +351,7 @@ def controller_bringup(
 def controller_upgrade(
     request,
     ssh_client,
+    package_profile,
     controller_fqdn,
     nsg_manager,
     raw_config,
@@ -405,6 +406,17 @@ def controller_upgrade(
         engine.run()
     except Exception as e:
         pytest.fail(f"Controller upgrade failed: {e}")
+
+    # Point package_profile at the NEW (dst) extract dir now that the
+    # upgrade succeeded. Without this, every downstream test that reads
+    # package_profile._actual_extract_dir (test_config_yaml_present,
+    # test_config_ha_matches_profile, test_config_domain_set, etc. in
+    # TestRadmInstall/TestPackageSetup) would keep validating against the
+    # OLD (src) version's config.yaml/extract dir -- set once by bringup's
+    # _extract_package() and never updated -- even though the upgrade has
+    # moved the controller onto the new version.
+    package_profile._actual_extract_dir = engine.dst_extract_dir
+    print(f"[conftest] package_profile._actual_extract_dir updated -> {engine.dst_extract_dir}")
 
     yield
 
