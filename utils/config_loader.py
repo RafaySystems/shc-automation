@@ -207,7 +207,10 @@ def resolve_size_profile(controller_size: str) -> tuple:
 import re as _re
 
 S3_BASE = "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com"
-PACKAGE_PATTERN = _re.compile(r"rafay-airgapped-controller-v([\d.]+)-(\d+)\.tar\.gz")
+# 'v' prefix on the version is optional -- both of these must match:
+#   rafay-airgapped-controller-v3.1-39.tar.gz
+#   rafay-airgapped-controller-4.2-1.tar.gz
+PACKAGE_PATTERN = _re.compile(r"rafay-airgapped-controller-v?([\d.]+)-(\d+)\.tar\.gz")
 
 
 @dataclass
@@ -219,11 +222,15 @@ class PackageProfile:
     The download URL is derived automatically from the package name unless
     a custom url is provided.
 
-    Example package name:
+    Example package names (the 'v' prefix on the version is optional):
         rafay-airgapped-controller-v3.1-39.tar.gz
         → version = 3.1
         → build   = 39
         → url     = https://rafay-airgap-controller.s3.../3.1/rafay-airgapped-controller-v3.1-39.tar.gz
+
+        rafay-airgapped-controller-4.2-1.tar.gz
+        → version = 4.2
+        → build   = 1
     """
     name: str           # e.g. rafay-airgapped-controller-v3.1-39.tar.gz
     install_dir: str    # e.g. /opt/rafay
@@ -234,8 +241,10 @@ class PackageProfile:
         if not m:
             raise ValueError(
                 f"Package name '{self.name}' does not match expected format.\n"
-                f"Expected: rafay-airgapped-controller-v{{version}}-{{build}}.tar.gz\n"
-                f"Example:  rafay-airgapped-controller-v3.1-39.tar.gz"
+                f"Expected: rafay-airgapped-controller-[v]{{version}}-{{build}}.tar.gz "
+                f"('v' prefix is optional)\n"
+                f"Examples: rafay-airgapped-controller-v3.1-39.tar.gz\n"
+                f"          rafay-airgapped-controller-4.2-1.tar.gz"
             )
         self.version = m.group(1)   # e.g. "3.1"
         self.build   = m.group(2)   # e.g. "39"

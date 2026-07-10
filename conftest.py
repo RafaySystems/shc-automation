@@ -357,12 +357,15 @@ def controller_upgrade(
     raw_config,
     controller_bringup,   # ensures bringup runs first
 ):
-    from lib.upgrade.upgrade_engine import UpgradeEngine
-
     dst_package = request.config.getoption("--dst-package", default=None)
     src_package = request.config.getoption("--src-package", default=None)
 
-    # Skip if no dst-package — bringup only run
+    # Skip if no dst-package — bringup only run. Deliberately checked BEFORE
+    # importing lib.upgrade.upgrade_engine: this fixture is autouse and every
+    # test transitively depends on it, so an import error inside the upgrade
+    # module (missing dependency, stale reference, etc.) must not be able to
+    # break a plain bringup-only run just because it happens to sit above
+    # this check. Only import once we know upgrade is actually requested.
     if not dst_package:
         print("[conftest] --dst-package not set — skipping upgrade")
         yield
@@ -374,9 +377,14 @@ def controller_upgrade(
         yield
         return
 
-    # Auto-extract versions from package names if not explicitly passed
+    from lib.upgrade.upgrade_engine import UpgradeEngine
+
+    # Auto-extract versions from package names if not explicitly passed.
+    # 'v' prefix is optional -- matches both rafay-airgapped-controller-v3.1-39.tar.gz
+    # and rafay-airgapped-controller-4.2-1.tar.gz (same fix as PACKAGE_PATTERN
+    # in utils/config_loader.py).
     def extract_version(pkg):
-        m = re.search(r'v([\d.]+-\d+)\.tar\.gz', pkg or "")
+        m = re.search(r'v?([\d.]+-\d+)\.tar\.gz', pkg or "")
         return m.group(1) if m else ""
 
     src_version = request.config.getoption("--src-version") or extract_version(src_package)
