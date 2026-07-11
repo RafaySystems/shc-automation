@@ -15,31 +15,47 @@ Jenkins usage (upgrade_only mode):
         --dst-package=rafay-airgapped-controller-v3.1-40.tar.gz \
         --os-type=ubuntu24 --controller-size=S --keep-vm
 
-NOTE on --src-package: if left blank (as in the Jenkins form), the src
-version is auto-detected from the live controller's installed config
-(see _detect_installed_version) rather than assumed from CLI. This lets
-the upgrade target an existing box without knowing its exact build number
-in advance.
+NOTE on --src-package: package_profile is built by conftest.py from
+--src-package (falling back to --package-name). If left blank, the
+engine still runs off whatever src_version/src_package the fixture
+resolves internally -- this file's own detection of "installed version"
+is purely for the report, not for deciding what to upgrade from.
 
 Requires fixtures already defined in conftest.py:
     ssh_client          -- connects to --controller-ip when --skip-bringup
                            is set, bypassing Terraform provisioning entirely
     controller_profile   -- size/ha/os_type profile
-    package_profile      -- src package info (name/version/url/tar_path)
-    secondary_ips        -- parsed from --secondary-ips
-    controller_upgrade   -- wraps UpgradeEngine; runs engine.run() and sets
+    package_profile      -- src package info (name/version/url/tar_path),
+                           built from --src-package (falls back to
+                           --package-name if that's unset)
+    controller_upgrade   -- autouse, session-scoped. Wraps UpgradeEngine;
+                           runs engine.run() and sets
                            package_profile._actual_extract_dir to the NEW
                            (dst) extract dir on success
 
-This file assumes those fixture names match conftest.py. If any fixture
-is named differently, update the signatures below accordingly -- the
-logic/assertions are what matters.
+IMPORTANT — fixture timing: controller_upgrade is autouse + session-scoped
+and depends on controller_bringup (also autouse). Both run during the
+SETUP of the first test in this file that pytest executes -- i.e. by the
+time ANY test body below runs, the upgrade has already happened. There is
+no way to write a true "before upgrade" check as a test in this file; the
+classes below are therefore purely POST-HOC validation, same pattern as
+TestRadmInstall in test_controller_install.py. Nothing here gates or
+delays the upgrade itself -- if you need genuine preconditions enforced
+before upgrading, those belong inside UpgradeEngine.run() itself, or in a
+separate earlier pytest session (e.g. a smoke-test file run first in the
+Jenkins pipeline).
 """
 
 import re
 import pytest
 
 pytestmark = [pytest.mark.order(2), pytest.mark.controller, pytest.mark.upgrade]
+
+
+def _extract_version(pkg: str) -> str:
+    """Same pattern as conftest.py's extract_version() -- 'v' prefix optional."""
+    m = re.search(r'v?([\d.]+-\d+)\.tar\.gz', pkg or "")
+    return m.group(1) if m else ""
 
 
 def attach_output(extras, label: str, content: str):
@@ -56,10 +72,10 @@ def attach_output(extras, label: str, content: str):
 def _detect_installed_version(ssh_client) -> str:
     """
     Best-effort detection of the currently-installed controller version by
-    reading the extracted package directory name under /opt/rafay, when
-    --src-package is not supplied. Falls back to empty string if nothing
-    is found (some validations below will then be skipped rather than
-    failing on data we were never given).
+    reading the extracted package directory name under /opt/rafay. Used
+    purely for report/diagnostic purposes in this file -- see module
+    docstring on why these checks can't gate the upgrade (autouse fixture
+    timing). Falls back to empty string if nothing is found.
     """
     out, rc = ssh_client.run(
         "ls -1 /opt/rafay/ 2>/dev/null | grep '^rafay-airgapped-controller' | head -1"
@@ -70,57 +86,30 @@ def _detect_installed_version(ssh_client) -> str:
     return m.group(1) if m else ""
 
 
-class TestUpgradePreconditions:
-    """Sanity checks before attempting the upgrade."""
+class TestUpgradeReportedState:
+    """
+    Informational checks recorded for the report. These run AFTER the
+    upgrade already happened (see module docstring on fixture timing) --
+    they are not gates. Their main value is making it easy to see, from
+    the pytest-html/Allure report, what version was installed going in
+    and whether the box was already healthy before this run touched it.
+    """
 
-    def test_ssh_reachable(self, ssh_client, extras):
-        """Primary controller must be reachable over SSH before upgrading."""
-        out, rc = ssh_client.run("hostname && uptime")
-        attach_output(extras, "hostname/uptime", out)
-        assert rc == 0, f"Could not reach controller over SSH: {out}"
-
-    def test_existing_cluster_healthy_before_upgrade(self, ssh_client, extras):
-        """
-        Cluster should be fully healthy BEFORE we touch it. Upgrading on top
-        of an already-unhealthy cluster makes root-causing any post-upgrade
-        failure ambiguous (was it the upgrade, or a pre-existing problem?).
-        """
-        out, rc = ssh_client.run("kubectl get pods -A --no-headers 2>/dev/null")
-        attach_output(extras, "pre-upgrade pod status", out)
-        lines = [l for l in out.splitlines() if l.strip()]
-        not_ready = [l for l in lines if "Running" not in l and "Completed" not in l]
-        assert rc == 0 and lines, "kubectl get pods failed -- is kubeconfig set up on this box?"
-        assert not not_ready, (
-            f"{len(not_ready)} pod(s) not healthy BEFORE upgrade -- fix these first:\n"
-            + "\n".join(not_ready[:10])
-        )
-
-    def test_src_version_matches_installed(self, ssh_client, package_profile, extras):
-        """
-        If --src-package was explicitly supplied, confirm it actually matches
-        what's installed on the box -- catches a mismatched/stale Jenkins
-        parameter before the upgrade engine does anything destructive.
-
-        If --src-package was left blank (auto-detect mode), this just
-        records what was detected for the report and does not assert.
-        """
+    def test_record_pre_upgrade_context(self, ssh_client, package_profile, extras):
+        """Record src version + pod state for the report (informational only)."""
         installed = _detect_installed_version(ssh_client)
-        attach_output(extras, "installed version (detected)", installed or "UNKNOWN")
+        attach_output(extras, "installed version (detected, post-hoc)", installed or "UNKNOWN")
 
         declared = getattr(package_profile, "version", "") or ""
-        if not declared:
-            print("[test_src_version_matches_installed] --src-package not set -- "
-                  f"auto-detected installed version: {installed or 'UNKNOWN'}")
-            pytest.skip("--src-package not supplied -- skipping explicit match check")
+        attach_output(extras, "--src-package declared version", declared or "(not supplied)")
 
-        assert installed, (
-            "Could not detect any installed controller package under /opt/rafay -- "
-            "is this actually a bringup'd controller?"
-        )
-        assert declared in installed or installed in declared, (
-            f"--src-package declares version '{declared}' but the box has "
-            f"'{installed}' installed -- check the Jenkins parameter"
-        )
+        if declared and installed and declared not in installed and installed not in declared:
+            print(
+                f"[test_record_pre_upgrade_context] NOTE: --src-package declared "
+                f"'{declared}' but detected extract dir suggests '{installed}' -- "
+                f"by this point the upgrade has already run, so this is informational "
+                f"only, not a gate. Check Jenkins parameters if this looks wrong."
+            )
 
 
 class TestUpgradeExecution:
@@ -160,14 +149,23 @@ class TestPostUpgradeHealth:
         ]
         assert not bad, f"{len(bad)} unhealthy pod(s) after upgrade:\n" + "\n".join(bad)
 
-    def test_dst_version_installed(self, ssh_client, package_profile, extras):
-        """Confirm the NEW (dst) version is what's actually on disk now."""
+    def test_dst_version_installed(self, ssh_client, request, extras):
+        """
+        Confirm the NEW (dst) version is what's actually on disk now.
+        package_profile only ever holds the SRC package info in this
+        codebase (conftest.py builds it from --src-package/--package-name),
+        so dst version is read straight from the --dst-package CLI option
+        rather than off package_profile.
+        """
         installed = _detect_installed_version(ssh_client)
         attach_output(extras, "post-upgrade installed version", installed or "UNKNOWN")
 
-        dst_version = getattr(package_profile, "_dst_version", None) or getattr(
-            package_profile, "version", ""
+        dst_package = request.config.getoption("--dst-package") or ""
+        dst_version = (
+            request.config.getoption("--dst-version") or _extract_version(dst_package)
         )
+        attach_output(extras, "--dst-package declared version", dst_version or "UNKNOWN")
+
         assert installed, "Could not detect installed version after upgrade"
         if dst_version:
             assert dst_version in installed or installed in dst_version, (
