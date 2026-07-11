@@ -8,24 +8,20 @@ defines hops and knows how to find them.
 
 Naming convention for hop files:
 
-    hop_<from_short>_to_<to_short>_upgrade.py
+    upgrade_<from_short>_to_<to_short>.py
 
 where <from_short>/<to_short> is the trailing numeric part of the version
 string, e.g. version "3.1-40" -> short "40". So the 3.1-39 -> 3.1-40 hop
 lives in:
 
-    hop_39_to_40_upgrade.py
-
-(Prefixed with "hop_" rather than starting with the digit "39" directly --
-Python module names can't start with a digit, so a bare "39_to_40_upgrade.py"
-can't be imported with a normal `import` statement.)
+    upgrade_39_to_40.py
 
 Each hop file defines exactly one module-level dict named HOP. See
-hop_39_to_40_upgrade.py for the full template and an explanation of every
+upgrade_39_to_40.py for the full template and an explanation of every
 available hook key.
 
 To add a new hop:
-  1. Copy an existing hop_*.py file as a template.
+  1. Copy an existing upgrade_*.py file as a template.
   2. Rename it to match the new from/to versions.
   3. Update the "from"/"to" fields and the command lists.
   4. Nothing else needs to change -- get_hop() below discovers and
@@ -49,9 +45,9 @@ import pkgutil
 
 
 # Every key an upgrade_engine.py caller might look for on a hop dict.
-# Any key not defined in a given hop_*.py file is filled in as an empty
-# list by get_hop() below, so hop files that only define a subset of
-# hooks don't break the engine when it looks one up.
+# Any key not defined in a given upgrade_*.py file is filled in as an
+# empty list by get_hop() below, so hop files that only define a subset
+# of hooks don't break the engine when it looks one up.
 HOOK_KEYS = (
     "pre_commands",
     "after_radm_dependency",
@@ -65,13 +61,13 @@ def _short_version(version: str) -> str:
     """
     '3.1-39' -> '39'
     Takes the trailing numeric segment after the last '-', matching the
-    hop_<from_short>_to_<to_short>_upgrade.py filename convention.
+    upgrade_<from_short>_to_<to_short>.py filename convention.
     """
     return version.split("-")[-1]
 
 
 def _expected_module_name(from_version: str, to_version: str) -> str:
-    return f"hop_{_short_version(from_version)}_to_{_short_version(to_version)}_upgrade"
+    return f"upgrade_{_short_version(from_version)}_to_{_short_version(to_version)}"
 
 
 def get_hop(from_version: str, to_version: str) -> dict:
@@ -94,14 +90,14 @@ def get_hop(from_version: str, to_version: str) -> dict:
             f"No upgrade path registered for {from_version} -> {to_version}.\n"
             f"Expected file: lib/upgrade/hops/{module_name}.py\n"
             f"Create it with a HOP dict -- see "
-            f"lib/upgrade/hops/hop_39_to_40_upgrade.py for the template."
+            f"lib/upgrade/hops/upgrade_39_to_40.py for the template."
         ) from e
 
     hop = getattr(module, "HOP", None)
     if hop is None:
         raise ValueError(
             f"lib/upgrade/hops/{module_name}.py must define a module-level "
-            f"HOP dict (see hop_39_to_40_upgrade.py for the template)."
+            f"HOP dict (see upgrade_39_to_40.py for the template)."
         )
 
     declared_from = hop.get("from")
@@ -135,7 +131,7 @@ def list_available_hops() -> list:
 
     pairs = []
     for _, module_name, _ in pkgutil.iter_modules(_self.__path__):
-        if not module_name.startswith("hop_"):
+        if not module_name.startswith("upgrade_"):
             continue
         try:
             module = importlib.import_module(f"lib.upgrade.hops.{module_name}")
