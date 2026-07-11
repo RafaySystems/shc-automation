@@ -149,16 +149,30 @@ class TestPostUpgradeHealth:
         ]
         assert not bad, f"{len(bad)} unhealthy pod(s) after upgrade:\n" + "\n".join(bad)
 
-    def test_dst_version_installed(self, ssh_client, request, extras):
+    def test_dst_version_installed(self, ssh_client, package_profile, request, extras):
         """
-        Confirm the NEW (dst) version is what's actually on disk now.
-        package_profile only ever holds the SRC package info in this
-        codebase (conftest.py builds it from --src-package/--package-name),
-        so dst version is read straight from the --dst-package CLI option
-        rather than off package_profile.
+        Confirm the NEW (dst) version is what's actually active post-upgrade.
+
+        NOTE: this deliberately does NOT use _detect_installed_version()'s
+        `ls /opt/rafay/ | grep ... | head -1` approach. The upgrade never
+        deletes the old (src) extract directory, so /opt/rafay/ contains
+        BOTH rafay-airgapped-controller-v3.1-39/ and .../v3.1-40/ side by
+        side after a successful upgrade. `ls` sorts alphabetically, and
+        "39" < "40" character-by-character, so `head -1` deterministically
+        picks the OLD directory regardless of which version actually ran --
+        this caused a false failure even on a fully successful upgrade.
+
+        Instead, use package_profile._actual_extract_dir, which the
+        controller_upgrade fixture in conftest.py explicitly sets to
+        engine.dst_extract_dir on success -- that's the actual source of
+        truth for "what did the upgrade just point the cluster at",
+        rather than re-deriving it from a directory listing.
         """
-        installed = _detect_installed_version(ssh_client)
-        attach_output(extras, "post-upgrade installed version", installed or "UNKNOWN")
+        actual_extract_dir = getattr(package_profile, "_actual_extract_dir", "") or ""
+        attach_output(extras, "post-upgrade active extract dir", actual_extract_dir or "UNKNOWN")
+
+        installed = _extract_version(actual_extract_dir + ".tar.gz") or actual_extract_dir
+        attach_output(extras, "post-upgrade installed version (from active extract dir)", installed or "UNKNOWN")
 
         dst_package = request.config.getoption("--dst-package") or ""
         dst_version = (
@@ -166,10 +180,14 @@ class TestPostUpgradeHealth:
         )
         attach_output(extras, "--dst-package declared version", dst_version or "UNKNOWN")
 
-        assert installed, "Could not detect installed version after upgrade"
+        assert actual_extract_dir, (
+            "package_profile._actual_extract_dir was never set -- "
+            "controller_upgrade fixture may not have completed successfully"
+        )
         if dst_version:
             assert dst_version in installed or installed in dst_version, (
-                f"Expected dst version '{dst_version}' installed, found '{installed}'"
+                f"Expected dst version '{dst_version}' installed, found '{installed}' "
+                f"(active extract dir: {actual_extract_dir})"
             )
 
     def test_ha_master_node_count(self, ssh_client, controller_profile, extras):
