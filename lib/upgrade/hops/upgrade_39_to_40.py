@@ -18,19 +18,26 @@ Command rules (same as before):
 Available hook keys, in the order the engine runs them:
 
     pre_commands              -- before download/radm phases run at all
-    [radm dependency runs, new version]
+    [new config.yaml created from old config.yaml + archive-directory patch]
+    config_patches            -- version-specific field edits against the
+                                 NEW config.yaml, right after it's created
+    [radm dependency runs -- NEW package only]
     after_radm_dependency     -- right after radm dependency completes
-    [radm application runs, new version]
+    [radm application runs -- NEW package only]
     after_radm_application    -- right after radm application completes
-    post_commands             -- after the OLD cluster is torn down /
-                                 patched, before the NEW radm cluster runs
-    [radm cluster runs, new version]
+    post_commands             -- right before radm cluster runs
+    [radm cluster runs -- NEW package only]
     after_radm_cluster        -- right after radm cluster completes,
                                  before final pod-health polling
 
-Any hook key can be omitted entirely -- upgrade_registry.py fills in an
-empty list for any key not defined here, so you only need to write the
-hooks this particular hop actually needs.
+NOTE: every radm command (dependency, application, cluster) in this engine
+runs exactly once, against the NEW package only. There is no separate
+"old package" radm cluster pass.
+
+Any hook key can be omitted entirely -- get_hop() in
+lib/upgrade/hops/__init__.py fills in an empty list for any key not
+defined here, so you only need to write the hooks this particular hop
+actually needs.
 """
 
 HOP = {
@@ -70,6 +77,21 @@ HOP = {
         """kubectl delete $(kubectl api-resources --verbs=list --namespaced -o name | tr '\\n' ',' | sed 's/,$//') -l app.kubernetes.io/part-of=kube-prometheus-stack -n rafay-core 2>/dev/null || true""",
     ],
 
+    # ── config_patches ──────────────────────────────────────────────────
+    # Runs against the NEW config.yaml right after create_upgrade_config
+    # copies the old config forward as a base -- before any radm command
+    # reads it. 3.1-40 moves the storageClass provisioners from the
+    # openebs-* internal storage stack to longhorn-*. Every other field in
+    # config.yaml (star-domain, ha, size, type, etc.) is left exactly as
+    # it was in 3.1-39's config.yaml -- only these three storageClass
+    # values change. {config} is filled in by upgrade_engine.py with the
+    # actual new config.yaml path.
+    "config_patches": [
+        'sudo sed -i \'s|readWriteOnce: "[^"]*"|readWriteOnce: "longhorn-local"|\' {config} || true',
+        'sudo sed -i \'s|readWriteOnceReplicated: "[^"]*"|readWriteOnceReplicated: "longhorn"|\' {config} || true',
+        'sudo sed -i \'s|readWriteMany: "[^"]*"|readWriteMany: "longhorn-rwx"|\' {config} || true',
+    ],
+
     # ── after_radm_dependency ───────────────────────────────────────────
     # Runs immediately after the new version's `radm dependency` completes,
     # before `radm application` starts. Nothing needed for this hop yet --
@@ -79,12 +101,12 @@ HOP = {
 
     # ── after_radm_application ──────────────────────────────────────────
     # Runs immediately after the new version's `radm application` completes,
-    # before the old-cluster teardown / post_commands / new radm cluster.
+    # before post_commands / radm cluster.
     "after_radm_application": [],
 
     # ── post_commands ───────────────────────────────────────────────────
-    # Runs AFTER the OLD cluster is torn down/patched, BEFORE the NEW
-    # radm cluster runs. All warn-only -- end with || true.
+    # Runs right before the (single, new-package-only) radm cluster call.
+    # All warn-only -- end with || true.
     "post_commands": [
         # Enable paas-api DAY2 operations
         "kubectl set env deployment/paas-api WORKSPACE_API_ALLOW_DAY2_OPERATIONS=true -n rafay-core 2>/dev/null || true",

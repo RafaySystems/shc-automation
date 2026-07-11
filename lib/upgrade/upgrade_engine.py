@@ -2,7 +2,7 @@
 lib/upgrade/upgrade_engine.py
 
 Written ONCE — never changes when new versions are added.
-Per-hop commands live in lib/upgrade/hops/hop_<from>_to_<to>_upgrade.py --
+Per-hop commands live in lib/upgrade/hops/upgrade_<from>_to_<to>.py --
 see that package's __init__.py for get_hop() / the hook naming convention.
 
 Phases per hop, in the order they actually run:
@@ -10,17 +10,21 @@ Phases per hop, in the order they actually run:
   2.  download                 — new package via aria2c
   3.  extract                  — new package via pigz/tar
   4.  create_config            — copy template, patch fields from old config
+      config_patches           — version-specific config.yaml field edits
+                                  (warn on failure), e.g. storageClass
+                                  provisioner renames between versions
   5.  copy_radm                — new radm → /usr/bin/
-  6.  radm dependency          — always same
+  6.  radm dependency          — always same, NEW package only
       after_radm_dependency    — version-specific shell commands (warn on failure)
   7.  wait elasticsearch       — wait for green
-  8.  radm application         — always same
+  8.  radm application         — always same, NEW package only
       after_radm_application   — version-specific shell commands (warn on failure)
-  9.  radm cluster old         — from source package dir
-  10. post_commands            — version-specific shell commands (warn on failure)
-                                  (runs after the OLD cluster, before the NEW one --
-                                  same meaning as before, unchanged)
-  11. radm cluster new         — from dest package dir
+  9.  post_commands            — version-specific shell commands (warn on failure),
+                                  runs right before radm cluster
+  10. radm cluster             — NEW package only (single pass -- there is
+                                  no separate "old package" radm cluster
+                                  pass; every radm command in this engine
+                                  runs against dst_extract_dir/new config)
       after_radm_cluster       — version-specific shell commands (warn on failure)
 """
 
@@ -32,7 +36,7 @@ from lib.upgrade.hops import get_hop
 PHASE_WAIT = {
     "radm_dependency":  {"interval": 20, "max_wait": 1500},
     "radm_application": {"interval": 20, "max_wait": 2400},
-    "radm_cluster":     {"interval": 20, "max_wait": 1200},
+    "radm_cluster":     {"interval": 20, "max_wait": 2500},
     "elasticsearch":    {"interval": 30, "max_wait": 600},
 }
 
@@ -86,24 +90,24 @@ class UpgradeEngine:
         self._phase("download_new_package",  self._download_new_package)
         self._phase("extract_new_package",   self._extract_new_package)
         self._phase("create_upgrade_config", self._create_upgrade_config)
+        self._apply_config_patches(hop.get("config_patches", []))
         self._phase("copy_new_radm",         self._copy_new_radm)
 
-        # 3. radm dependency, then its hook (fatal phase, warn-only hook)
+        # 3. radm dependency (new package only), then its hook
         self._phase("radm_dependency", self._radm_dependency)
         self._run_commands("after_radm_dependency", hop.get("after_radm_dependency", []))
 
         self._phase("wait_elasticsearch", self._wait_elasticsearch)
 
-        # 4. radm application, then its hook (fatal phase, warn-only hook)
+        # 4. radm application (new package only), then its hook
         self._phase("radm_application", self._radm_application)
         self._run_commands("after_radm_application", hop.get("after_radm_application", []))
 
-        # 5. Old cluster, then post_commands (unchanged meaning: old→new boundary)
-        self._phase("radm_cluster_old", self._radm_cluster_old)
+        # 5. post_commands run right before the single radm cluster call
         self._run_commands("post", hop.get("post_commands", []))
 
-        # 6. Final radm cluster (new version), then its hook
-        self._phase("radm_cluster_new", self._radm_cluster_new)
+        # 6. radm cluster (new package only -- no old-package pass)
+        self._phase("radm_cluster", self._radm_cluster)
         self._run_commands("after_radm_cluster", hop.get("after_radm_cluster", []))
 
         print("\n" + "═" * 60)
@@ -138,6 +142,41 @@ class UpgradeEngine:
             print(f"[upgrade] [{i}/{len(commands)}] {label}")
             try:
                 out, rc = self.ssh.run(cmd, timeout=120)
+                if rc == 0:
+                    print(f"[upgrade] ✓")
+                else:
+                    print(f"[upgrade] ⚠ WARNING (exit {rc}): {out[-150:]} — continuing")
+            except Exception as e:
+                print(f"[upgrade] ⚠ WARNING: {e} — continuing")
+
+    def _apply_config_patches(self, patches: list):
+        """
+        Run hop-specific field-level edits against the NEW config.yaml,
+        right after create_upgrade_config copies the old config forward as
+        a base. This is for version-specific config field changes that
+        must land in config.yaml BEFORE any radm command reads it --
+        e.g. a storageClass provisioner rename between versions -- as
+        opposed to pre/post_commands, which run kubectl/shell commands
+        against the live cluster rather than editing a file.
+
+        Each command in the list is a template containing the literal
+        substring "{config}", which gets replaced with the actual new
+        config.yaml path before running. Same warn-on-failure semantics
+        as pre/post_commands -- end each command with || true unless a
+        failure here should stop the upgrade.
+        """
+        if not patches:
+            print(f"[upgrade] No config_patches for this hop")
+            return
+
+        new_config = f"{self.dst_extract_dir}/config.yaml"
+        print(f"\n[upgrade] ── CONFIG_PATCHES ({len(patches)} total) " + "─" * 20)
+        for i, cmd_template in enumerate(patches, 1):
+            cmd   = cmd_template.format(config=new_config)
+            label = cmd.strip()[:60] + ("..." if len(cmd.strip()) > 60 else "")
+            print(f"[upgrade] [{i}/{len(patches)}] {label}")
+            try:
+                out, rc = self.ssh.run(cmd, timeout=60)
                 if rc == 0:
                     print(f"[upgrade] ✓")
                 else:
@@ -238,7 +277,7 @@ class UpgradeEngine:
 
     def _radm_dependency(self):
         """
-        Run: sudo ./radm dependency --config config.yaml
+        Run: sudo ./radm dependency --config config.yaml (NEW package dir)
 
         Command timeout is 1800s (30 min), not 600s -- 10 minutes proved too
         tight under normal OCI resource contention / image pull latency (see
@@ -283,23 +322,21 @@ class UpgradeEngine:
         assert rc == 0, f"radm application failed (exit {rc}): {out[-300:]}"
         self._poll_pods(PHASE_WAIT["radm_application"], "after radm application")
 
-    def _radm_cluster_old(self):
-        print(f"[radm_cluster_old] Running from {self.src_version} dir ...")
-        out, rc = self.ssh.run_stream(
-            f"cd {self.src_extract_dir} && sudo ./radm cluster --config config.yaml 2>&1",
-            timeout=1200, prefix="[radm cluster old]",
-        )
-        assert rc == 0, f"radm cluster (old) failed (exit {rc}): {out[-300:]}"
-        self._poll_pods(PHASE_WAIT["radm_cluster"], "after radm cluster old")
+    def _radm_cluster(self):
+        """
+        Run: sudo ./radm cluster --config config.yaml -- NEW package dir only.
 
-    def _radm_cluster_new(self):
-        print(f"[radm_cluster_new] Running from {self.dst_version} dir ...")
+        There is no separate "old package" radm cluster pass in this
+        engine. Every radm command (dependency, application, cluster) runs
+        exactly once, against dst_extract_dir / the new config.yaml.
+        """
+        print(f"[radm_cluster] Running from {self.dst_version} dir ...")
         out, rc = self.ssh.run_stream(
             f"cd {self.dst_extract_dir} && sudo ./radm cluster --config config.yaml 2>&1",
-            timeout=2400, prefix="[radm cluster new]",
+            timeout=2400, prefix="[radm cluster]",
         )
-        assert rc == 0, f"radm cluster (new) failed (exit {rc}): {out[-300:]}"
-        self._poll_pods(PHASE_WAIT["radm_cluster"], "after radm cluster new")
+        assert rc == 0, f"radm cluster failed (exit {rc}): {out[-300:]}"
+        self._poll_pods(PHASE_WAIT["radm_cluster"], "after radm cluster")
 
     # ── Poll helper ───────────────────────────────────────────────────────────
 

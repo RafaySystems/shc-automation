@@ -38,6 +38,13 @@ Usage from upgrade_engine.py:
     hop["after_radm_application"]  # list[str]
     hop["post_commands"]           # list[str]
     hop["after_radm_cluster"]      # list[str]
+    hop["config_patches"]          # list[str] -- run against the NEW
+                                    # config.yaml right after it's created,
+                                    # before any radm command reads it. Each
+                                    # command is a template containing the
+                                    # literal substring "{config}", which
+                                    # upgrade_engine.py fills in with the
+                                    # actual new config.yaml path.
 """
 
 import importlib
@@ -54,6 +61,7 @@ HOOK_KEYS = (
     "after_radm_application",
     "post_commands",
     "after_radm_cluster",
+    "config_patches",
 )
 
 
