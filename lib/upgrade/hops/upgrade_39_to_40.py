@@ -80,17 +80,9 @@ HOP = {
     # ── config_patches ──────────────────────────────────────────────────
     # Runs against the NEW config.yaml right after create_upgrade_config
     # copies the old config forward as a base -- before any radm command
-    # reads it. 3.1-40 moves the storageClass provisioners from the
-    # openebs-* internal storage stack to longhorn-*. Every other field in
-    # config.yaml (star-domain, ha, size, type, etc.) is left exactly as
-    # it was in 3.1-39's config.yaml -- only these three storageClass
-    # values change. {config} is filled in by upgrade_engine.py with the
-    # actual new config.yaml path.
-    "config_patches": [
-        'sudo sed -i \'s|readWriteOnce: "[^"]*"|readWriteOnce: "longhorn-local"|\' {config} || true',
-        'sudo sed -i \'s|readWriteOnceReplicated: "[^"]*"|readWriteOnceReplicated: "longhorn"|\' {config} || true',
-        'sudo sed -i \'s|readWriteMany: "[^"]*"|readWriteMany: "longhorn-rwx"|\' {config} || true',
-    ],
+    # reads it. Nothing needed for this hop -- storageClass and every
+    # other field carry forward unchanged from 3.1-39's config.yaml.
+    "config_patches": [],
 
     # ── after_radm_dependency ───────────────────────────────────────────
     # Runs immediately after the new version's `radm dependency` completes,
