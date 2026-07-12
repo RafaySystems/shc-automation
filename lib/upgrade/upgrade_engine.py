@@ -33,10 +33,25 @@ import time
 from lib.upgrade.hops import get_hop
 
 # ── Wait policies ─────────────────────────────────────────────────────────────
+# NOTE: these govern the POST-command pod-polling step only, same as
+# lib/controller/bringup.py's PHASE_WAIT. They do NOT affect the radm
+# command timeouts themselves (those are set individually in each phase
+# method below -- e.g. _radm_dependency's ssh.run(..., timeout=1800)).
+#
+# Reduced to match bringup.py's already-reduced values. These pods either
+# stabilize within a few minutes (the common case) or they're stuck in a
+# genuine CrashLoopBackOff that won't resolve no matter how long we wait --
+# in the latter case, waiting the old 25/40/41-minute ceilings just burns
+# time without changing the outcome, since a permanently-crashlooping pod
+# doesn't become healthy by waiting longer. TestPostUpgradeHealth /
+# TestPostInstallHealth / regression / smoke tests still strictly check
+# every pod afterward and will correctly fail the build if something is
+# really broken -- this change only affects how long we wait before moving
+# on to that real verification step.
 PHASE_WAIT = {
-    "radm_dependency":  {"interval": 20, "max_wait": 1500},
-    "radm_application": {"interval": 20, "max_wait": 2400},
-    "radm_cluster":     {"interval": 20, "max_wait": 2500},
+    "radm_dependency":  {"interval": 20, "max_wait": 600},
+    "radm_application": {"interval": 20, "max_wait": 800},
+    "radm_cluster":     {"interval": 20, "max_wait": 800},
     "elasticsearch":    {"interval": 30, "max_wait": 600},
 }
 
