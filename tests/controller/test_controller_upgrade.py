@@ -59,7 +59,20 @@ def _extract_version(pkg: str) -> str:
 
 
 def attach_output(extras, label: str, content: str):
-    """Embed command output into the pytest-html report (3.x/4.x compatible)."""
+    """
+    Embed command output into the pytest-html report (3.x/4.x compatible).
+    Also mirrors the same content to the Allure report (if allure is
+    importable), so results are visible in whichever report is open
+    without needing to SSH to the Jenkins node.
+
+    NOTE: this file's attach_output previously only wrote to pytest-html --
+    it never called allure.attach(), unlike test_controller_install.py's
+    version. That's why every test in this file (test_dst_version_installed,
+    test_ha_master_node_count, test_console_endpoint_reachable,
+    test_upgrade_completes, test_record_pre_upgrade_context, etc.) showed up
+    in Allure with a status but zero attachments/logs -- the pytest-html
+    report had the content the whole time, just not Allure.
+    """
     import pytest_html
     block = f"<pre style='font-size:12px;white-space:pre-wrap'>{content}</pre>"
     item = pytest_html.extras.html(f"<b>{label}</b>{block}")
@@ -67,6 +80,14 @@ def attach_output(extras, label: str, content: str):
         extras.append(item)
     else:
         extras.extend([item])
+
+    try:
+        import allure
+        allure.attach(content, name=label, attachment_type=allure.attachment_type.TEXT)
+    except Exception:
+        # Allure not installed / not active in this run -- pytest-html
+        # attachment above still succeeded, so don't fail the test over this.
+        pass
 
 
 def _detect_installed_version(ssh_client) -> str:
