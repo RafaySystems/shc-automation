@@ -1121,7 +1121,14 @@ class TestRadmInstall:
             attach_output(extras, "kubectl get nodes (after join)", nodes_out)
             print("[test_radm_init_completes] All nodes:\n" + nodes_out)
 
-        self._wait_for_pods(ssh_client, extras, label="after radm init")
+        # already_initialized => radm init was skipped above (kubeconfig
+        # already existed, e.g. right after an upgrade) -- nothing was
+        # actually re-run, so there's nothing new to wait for beyond a
+        # single confirmation snapshot. Same fix as dependency/application/
+        # cluster: only fall back to the full poll loop when radm init
+        # genuinely just ran.
+        self._wait_for_pods(ssh_client, extras, label="after radm init",
+                            quick_check=already_initialized)
 
     def test_radm_dependency_completes(self, ssh_client, package_profile, controller_profile, extras):
         extract_dir = (
