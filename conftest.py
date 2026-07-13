@@ -347,7 +347,31 @@ def controller_bringup(
 
 
 # ── controller_upgrade fixture ────────────────────────────────────────────────
-@pytest.fixture(scope="session", autouse=True)
+#
+# NOTE: deliberately NOT autouse anymore.
+#
+# Previously this fixture was autouse=True, which meant it (along with
+# controller_bringup) fired during the SETUP of the very first test pytest
+# collected in the whole session -- before ANY test body ran, including
+# signup/login in test_console_login.py. That made it structurally
+# impossible to get the sequence:
+#
+#     bringup -> signup/login -> upgrade -> verify old creds still work
+#
+# because the upgrade had already silently completed before signup/login
+# even got a chance to run.
+#
+# Now, this fixture only runs when a test explicitly requests it as a
+# parameter -- which TestUpgradeExecution.test_upgrade_completes in
+# test_controller_upgrade.py already does. Since it's still session-scoped,
+# it still only ever runs ONCE per session (cached after the first request),
+# and any later test that also requests it (or that runs after it in the
+# same session, even without listing it) sees the already-upgraded state --
+# same as before, just no longer forced to happen before every other test.
+#
+# controller_bringup remains autouse=True, so bringup still always happens
+# first, unconditionally, exactly as before.
+@pytest.fixture(scope="session")
 def controller_upgrade(
     request,
     ssh_client,
@@ -361,11 +385,10 @@ def controller_upgrade(
     src_package = request.config.getoption("--src-package", default=None)
 
     # Skip if no dst-package — bringup only run. Deliberately checked BEFORE
-    # importing lib.upgrade.upgrade_engine: this fixture is autouse and every
-    # test transitively depends on it, so an import error inside the upgrade
-    # module (missing dependency, stale reference, etc.) must not be able to
-    # break a plain bringup-only run just because it happens to sit above
-    # this check. Only import once we know upgrade is actually requested.
+    # importing lib.upgrade.upgrade_engine: an import error inside the
+    # upgrade module (missing dependency, stale reference, etc.) must not be
+    # able to break a plain bringup-only run just because it happens to sit
+    # above this check. Only import once we know upgrade is actually requested.
     if not dst_package:
         print("[conftest] --dst-package not set — skipping upgrade")
         yield

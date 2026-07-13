@@ -28,22 +28,34 @@ Requires fixtures already defined in conftest.py:
     package_profile      -- src package info (name/version/url/tar_path),
                            built from --src-package (falls back to
                            --package-name if that's unset)
-    controller_upgrade   -- autouse, session-scoped. Wraps UpgradeEngine;
-                           runs engine.run() and sets
+    controller_upgrade   -- session-scoped (NOT autouse -- see conftest.py's
+                           comment on this fixture for why). Runs
+                           engine.run() the first time anything requests
+                           it as a parameter, and sets
                            package_profile._actual_extract_dir to the NEW
-                           (dst) extract dir on success
+                           (dst) extract dir on success. Cached afterward
+                           for the rest of the session.
 
-IMPORTANT — fixture timing: controller_upgrade is autouse + session-scoped
-and depends on controller_bringup (also autouse). Both run during the
-SETUP of the first test in this file that pytest executes -- i.e. by the
-time ANY test body below runs, the upgrade has already happened. There is
-no way to write a true "before upgrade" check as a test in this file; the
-classes below are therefore purely POST-HOC validation, same pattern as
-TestRadmInstall in test_controller_install.py. Nothing here gates or
-delays the upgrade itself -- if you need genuine preconditions enforced
-before upgrading, those belong inside UpgradeEngine.run() itself, or in a
-separate earlier pytest session (e.g. a smoke-test file run first in the
-Jenkins pipeline).
+IMPORTANT — fixture timing / ordering: controller_upgrade is no longer
+autouse, so it does NOT fire before every other test in the session. It
+only runs the first time a test explicitly requests it as a parameter --
+which TestUpgradeExecution.test_upgrade_completes below does. Because
+test_console_login.py collects alphabetically before this file, the
+intended sequence is:
+
+    controller_bringup (autouse, always first)
+      -> test_console_login.py: signup + login (creates the org/user)
+      -> this file's tests run, in order:
+           TestUpgradeReportedState  -- genuinely pre-upgrade now (the
+                                        upgrade hasn't fired yet at this
+                                        point in a normal full-suite run)
+           TestUpgradeExecution      -- REQUESTS controller_upgrade,
+                                        which is what actually triggers
+                                        the upgrade to run
+           TestPostUpgradeHealth     -- runs after, sees the upgraded state
+           TestPostUpgradeLogin      -- confirms the org/user created
+                                        BEFORE the upgrade can still log
+                                        in AFTER it
 """
 
 import re
@@ -64,14 +76,6 @@ def attach_output(extras, label: str, content: str):
     Also mirrors the same content to the Allure report (if allure is
     importable), so results are visible in whichever report is open
     without needing to SSH to the Jenkins node.
-
-    NOTE: this file's attach_output previously only wrote to pytest-html --
-    it never called allure.attach(), unlike test_controller_install.py's
-    version. That's why every test in this file (test_dst_version_installed,
-    test_ha_master_node_count, test_console_endpoint_reachable,
-    test_upgrade_completes, test_record_pre_upgrade_context, etc.) showed up
-    in Allure with a status but zero attachments/logs -- the pytest-html
-    report had the content the whole time, just not Allure.
     """
     import pytest_html
     block = f"<pre style='font-size:12px;white-space:pre-wrap'>{content}</pre>"
@@ -107,13 +111,29 @@ def _detect_installed_version(ssh_client) -> str:
     return m.group(1) if m else ""
 
 
+def _resolve_console_url(request, raw_config) -> str:
+    """
+    Resolve the org/user-facing console URL (console.{star_domain}, NOT
+    ops-console.{star_domain}) from --build-no + dns.base_domain in
+    dev.yaml. Same convention test_console_login.py's TestOrgAndUser uses
+    for the same purpose. Returns "" if it can't be determined.
+    """
+    base_domain  = raw_config.get("dns", {}).get("base_domain", "")
+    build_no_val = request.config.getoption("--build-no") or ""
+    if not (base_domain and build_no_val):
+        return ""
+    star_domain = f"shc-{build_no_val}.{base_domain}"
+    return f"https://console.{star_domain}"
+
+
 class TestUpgradeReportedState:
     """
-    Informational checks recorded for the report. These run AFTER the
-    upgrade already happened (see module docstring on fixture timing) --
-    they are not gates. Their main value is making it easy to see, from
+    Informational checks recorded for the report. In a full-suite run,
+    these now genuinely run BEFORE the upgrade fixture has fired (since
+    controller_upgrade is no longer autouse) -- see module docstring.
+    They are still not gates; their value is making it easy to see, from
     the pytest-html/Allure report, what version was installed going in
-    and whether the box was already healthy before this run touched it.
+    and whether the box was already healthy before this file touched it.
     """
 
     def test_record_pre_upgrade_context(self, ssh_client, package_profile, extras):
@@ -128,21 +148,23 @@ class TestUpgradeReportedState:
             print(
                 f"[test_record_pre_upgrade_context] NOTE: --src-package declared "
                 f"'{declared}' but detected extract dir suggests '{installed}' -- "
-                f"by this point the upgrade has already run, so this is informational "
-                f"only, not a gate. Check Jenkins parameters if this looks wrong."
+                f"check Jenkins parameters if this looks wrong."
             )
 
 
 class TestUpgradeExecution:
-    """Drives the actual upgrade via the controller_upgrade fixture."""
+    """
+    Drives the actual upgrade via the controller_upgrade fixture.
+
+    Requesting the controller_upgrade fixture here is what actually TRIGGERS
+    it to run -- it's session-scoped but no longer autouse, so nothing
+    upgrades the controller until this test (or another test requesting the
+    same fixture) executes. This is the deliberate hook point that lets
+    signup/login in test_console_login.py run beforehand.
+    """
 
     def test_upgrade_completes(self, controller_upgrade, package_profile, extras):
         """
-        Requesting the controller_upgrade fixture is what actually runs
-        UpgradeEngine.run() (pre_commands -> download/extract dst package ->
-        radm dependency -> wait_elasticsearch -> radm application ->
-        radm cluster_old -> post_commands -> radm cluster_new).
-
         By the time this test body runs, the fixture has already either
         succeeded (and this is just confirming the extract dir moved to the
         NEW package) or raised, which pytest surfaces as a fixture error
@@ -224,6 +246,13 @@ class TestPostUpgradeHealth:
         )
 
     def test_console_endpoint_reachable(self, ssh_client, extras):
+        """
+        NOTE: this only checks that SOMETHING responds over HTTP -- it does
+        NOT confirm that a real user can actually authenticate. For that
+        guarantee, see TestPostUpgradeLogin.test_existing_user_can_still_login
+        below, which performs a genuine login using credentials created
+        before the upgrade.
+        """
         out, rc = ssh_client.run(
             "curl -sk -o /dev/null -w '%{http_code}' https://localhost/ || echo FAILED"
         )
@@ -231,3 +260,87 @@ class TestPostUpgradeHealth:
         assert out.strip() not in ("000", "FAILED"), (
             "Console endpoint not responding after upgrade"
         )
+
+
+class TestPostUpgradeLogin:
+    """
+    Confirm the org/user created BEFORE the upgrade (in
+    test_console_login.py::TestOrgAndUser.test_create_org_and_user) can
+    still authenticate AFTER the upgrade completes.
+
+    This is a materially different guarantee than
+    TestPostUpgradeHealth.test_console_endpoint_reachable: that test only
+    confirms the console PROCESS is up and responding to HTTP. This test
+    confirms that auth/session/user-store data actually survived the
+    upgrade intact -- i.e. a real person who signed up before the upgrade
+    can still get into their account afterward, which is the thing an
+    end user actually cares about.
+
+    Deliberately reuses the SAME credentials test_console_login.py's
+    TestOrgAndUser created (console.test_org in dev.yaml) rather than
+    creating a new user here -- the whole point is to verify the
+    PRE-EXISTING user survived, not to test signup again.
+    """
+
+    def test_existing_user_can_still_login(self, controller_upgrade, request,
+                                            raw_config, extras):
+        """
+        Requesting controller_upgrade here (same as TestUpgradeExecution)
+        guarantees the upgrade has actually run before this test's body
+        executes, regardless of what order pytest happens to collect
+        files/classes in -- it's session-scoped, so if it already ran
+        (the normal case, since TestUpgradeExecution runs first in this
+        file), this just reuses the cached result at no extra cost.
+        """
+        import requests
+
+        console_url = _resolve_console_url(request, raw_config)
+        assert console_url, "Cannot determine console URL -- pass --build-no"
+
+        org_cfg  = raw_config.get("console", {}).get("test_org", {})
+        username = org_cfg.get("email",    "onprem@rafay.co")
+        password = org_cfg.get("password", "changeplz")
+
+        attach_output(extras, "Console URL", console_url)
+        attach_output(extras, "Username (created pre-upgrade)", username)
+
+        session = requests.Session()
+        session.verify = False
+
+        print(f"[test_existing_user_can_still_login] Logging in as pre-upgrade "
+              f"user '{username}' post-upgrade ...")
+        resp = session.post(
+            f"{console_url}/auth/v1/login/",
+            json={
+                "username": username,
+                "password": password,
+                "organization": "",
+                "usertype": "internal",
+            },
+            headers={
+                "accept": "application/json",
+                "content-type": "application/json",
+                "origin": console_url,
+                "referer": console_url + "/",
+            },
+            timeout=15,
+        )
+
+        attach_output(extras, "Post-upgrade login status", str(resp.status_code))
+        attach_output(extras, "Post-upgrade login response", resp.text[:300])
+        assert resp.status_code == 200, (
+            f"User '{username}' (created before the upgrade) could not log in "
+            f"after the upgrade ({resp.status_code}): {resp.text[:200]}\n"
+            f"This means user/session/auth data did not survive the upgrade "
+            f"intact -- a real customer would be locked out of their account."
+        )
+
+        rsid = session.cookies.get("rsid", "")
+        attach_output(extras, "Session cookie (rsid)",
+                      rsid[:20] + "..." if rsid else "MISSING")
+        assert rsid, (
+            "Login returned 200 but no rsid cookie was set -- "
+            "session was not actually established"
+        )
+        print(f"[test_existing_user_can_still_login] ✓ pre-upgrade user "
+              f"'{username}' logged in successfully post-upgrade — rsid: {rsid[:10]}...")
