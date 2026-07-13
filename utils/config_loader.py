@@ -206,11 +206,38 @@ def resolve_size_profile(controller_size: str) -> tuple:
 
 import re as _re
 
-S3_BASE = "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com"
-# 'v' prefix on the version is optional -- both of these must match:
-#   rafay-airgapped-controller-v3.1-39.tar.gz
-#   rafay-airgapped-controller-4.2-1.tar.gz
-PACKAGE_PATTERN = _re.compile(r"rafay-airgapped-controller-v?([\d.]+)-(\d+)\.tar\.gz")
+# Two separate S3 locations, two separate path conventions:
+#
+#   PROD (official releases):
+#     https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/{version}/{name}
+#     e.g. .../3.1/rafay-airgapped-controller-v3.1-40.tar.gz
+#
+#   DEV / RC (release-candidate / automation builds):
+#     https://dev-rafay-controller.s3.us-west-1.amazonaws.com/Automation/{name}
+#     e.g. .../Automation/rafay-airgapped-controller-v3.1-40-RC48541-1-35.tar.gz
+#     -- flat "Automation/" prefix, NO version subfolder.
+#
+# Which bucket a name belongs to is detected by the presence of an
+# "-RC<digits>" segment (e.g. "-RC48541") -- that's the signal that
+# distinguishes an RC/dev build from a prod release build.
+PROD_S3_BASE = "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com"
+DEV_S3_BASE  = "https://dev-rafay-controller.s3.us-west-1.amazonaws.com/Automation"
+
+RC_PATTERN = _re.compile(r"-RC\d+")
+
+# Best-effort version/build extraction -- NOT a strict full-name validator.
+# Uses .search() (not .match()/fullmatch()) so it finds "v{version}-{build}"
+# wherever it appears in the name and ignores anything after it -- this is
+# what lets RC/dev builds like:
+#   rafay-airgapped-controller-v3.1-40-RC48541-1-35.tar.gz
+# still resolve to version=3.1, build=40, rather than being rejected outright
+# for having extra suffix content after the build number.
+#
+# The 'v' prefix on the version is optional -- all of these match:
+#   rafay-airgapped-controller-v3.1-39.tar.gz          -> 3.1 / 39
+#   rafay-airgapped-controller-4.2-1.tar.gz            -> 4.2 / 1
+#   rafay-airgapped-controller-v3.1-40-RC48541-1-35... -> 3.1 / 40
+PACKAGE_PATTERN = _re.compile(r"rafay-airgapped-controller-v?([\d.]+)-(\d+)")
 
 
 @dataclass
@@ -219,8 +246,17 @@ class PackageProfile:
     Represents a controller installation package.
 
     Built from the 'package:' section of dev.yaml.
-    The download URL is derived automatically from the package name unless
-    a custom url is provided.
+    The download URL is derived automatically from the package name when it
+    matches the standard rafay-airgapped-controller-v{version}-{build}...
+    convention (RC/dev suffixes after the build number are fine). For any
+    other .tar.gz package name -- one that doesn't match closely enough to
+    extract a version -- pass --package-url (or --dst-package-url) explicitly
+    so the download URL doesn't have to be guessed.
+
+    The only HARD requirement on the name itself is that it ends in .tar.gz.
+    Everything else (version, build) is best-effort metadata used for
+    convenience (auto-deriving the S3 URL, populating reports) -- it is not
+    a gate on whether the package can be used.
 
     Example package names (the 'v' prefix on the version is optional):
         rafay-airgapped-controller-v3.1-39.tar.gz
@@ -231,27 +267,58 @@ class PackageProfile:
         rafay-airgapped-controller-4.2-1.tar.gz
         → version = 4.2
         → build   = 1
+
+        rafay-airgapped-controller-v3.1-40-RC48541-1-35.tar.gz
+        → version = 3.1
+        → build   = 40
+        → url     = https://dev-rafay-controller.s3.us-west-1.amazonaws.com/Automation/rafay-airgapped-controller-v3.1-40-RC48541-1-35.tar.gz
+        (detected as an RC/dev build via the "-RC<digits>" segment -- routed
+        to the dev bucket's flat Automation/ prefix, not the prod versioned
+        path. RC suffix is ignored for version/build extraction, but is kept
+        as-is in `name` / `tar_path` / `extract_dir` -- the RC identifier
+        is part of the actual filename on disk and in S3, so it must not
+        be stripped there)
     """
     name: str           # e.g. rafay-airgapped-controller-v3.1-39.tar.gz
     install_dir: str    # e.g. /opt/rafay
-    url: str = ""       # auto-derived if empty
+    url: str = ""       # auto-derived if possible, else must be passed in
 
     def __post_init__(self):
-        m = PACKAGE_PATTERN.match(self.name)
-        if not m:
+        # The only hard requirement: this has to be a .tar.gz file. Everything
+        # else about the name is best-effort.
+        if not self.name.endswith(".tar.gz"):
             raise ValueError(
-                f"Package name '{self.name}' does not match expected format.\n"
-                f"Expected: rafay-airgapped-controller-[v]{{version}}-{{build}}.tar.gz "
-                f"('v' prefix is optional)\n"
-                f"Examples: rafay-airgapped-controller-v3.1-39.tar.gz\n"
-                f"          rafay-airgapped-controller-4.2-1.tar.gz"
+                f"Package name '{self.name}' must end with .tar.gz"
             )
-        self.version = m.group(1)   # e.g. "3.1"
-        self.build   = m.group(2)   # e.g. "39"
 
-        # Derive URL from name if not explicitly set
+        m = PACKAGE_PATTERN.search(self.name)
+        if m:
+            self.version = m.group(1)   # e.g. "3.1"
+            self.build   = m.group(2)   # e.g. "40"
+        else:
+            # Doesn't match the known naming convention closely enough to
+            # extract a version -- that's fine, but we can no longer
+            # auto-derive the S3 URL below, so an explicit url becomes
+            # mandatory in that case.
+            self.version = ""
+            self.build   = ""
+
+        # Derive URL from name if not explicitly set.
+        # RC/dev builds go to the flat Automation/ prefix (no version
+        # subfolder); prod releases go to the versioned prod path.
         if not self.url:
-            self.url = f"{S3_BASE}/{self.version}/{self.name}"
+            if RC_PATTERN.search(self.name):
+                self.url = f"{DEV_S3_BASE}/{self.name}"
+            elif self.version:
+                self.url = f"{PROD_S3_BASE}/{self.version}/{self.name}"
+            else:
+                raise ValueError(
+                    f"Could not auto-derive a version from package name "
+                    f"'{self.name}' (expected something containing "
+                    f"'rafay-airgapped-controller-[v]{{version}}-{{build}}').\n"
+                    f"Pass --package-url (or --dst-package-url) explicitly "
+                    f"for package names that don't follow this convention."
+                )
 
     @property
     def extract_dir(self) -> str:
@@ -266,7 +333,7 @@ class PackageProfile:
     def summary(self) -> str:
         return (
             f"Package | name={self.name} | "
-            f"version={self.version} | build={self.build} | "
+            f"version={self.version or 'unknown'} | build={self.build or 'unknown'} | "
             f"url={self.url}"
         )
 
