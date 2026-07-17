@@ -49,7 +49,7 @@ from typing import Optional, List
 PHASE_WAIT = {
     "radm_init":        {"interval": 30, "max_wait": 300,   "label": "nodes Ready"},
     "radm_dependency":  {"interval": 20, "max_wait": 600,  "label": "pods Running"},
-    "radm_application": {"interval": 20, "max_wait": 800,  "label": "pods Running"},
+    "radm_application": {"interval": 20, "max_wait": 1200,  "label": "pods Running"},
     "radm_cluster":     {"interval": 20, "max_wait": 800,  "label": "pods Running"},
 }
 
