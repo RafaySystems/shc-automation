@@ -1,53 +1,43 @@
 """
 lib/upgrade/upgrade_engine.py
 
-Written ONCE — never changes when new versions are added.
-Per-hop commands live in lib/upgrade/hops/upgrade_<from>_to_<to>.py --
-see that package's __init__.py for get_hop() / the hook naming convention.
+UPDATED per team design review (2026-07-22):
+  - No more hop-file lookup. lib/upgrade/hops/ is no longer imported or
+    referenced anywhere -- confirmed via repo-wide grep that get_hop()
+    had no callers outside this file and its own package. The hops/
+    directory can be deleted entirely.
+  - pre_commands / after_radm_dependency_commands / after_radm_application_commands
+    are now passed in DIRECTLY as constructor arguments -- sourced from
+    the three Jenkins textboxes (base64-decoded in conftest.py before
+    reaching here), not looked up from any file.
+  - src_package_url / dst_package_url are now the primary inputs (full
+    URLs, passed directly from Jenkins) -- package "name" is derived via
+    a simple URL basename split (url.rsplit('/', 1)[-1]), which is 100%
+    reliable since it's just splitting a path, not parsing a version out
+    of a filename.
+  - src_version / dst_version are now PURELY COSMETIC -- best-effort
+    labels for print statements/logging only. No behavior in this class
+    depends on them being correct, since there is no more per-version
+    hop lookup to get wrong.
 
-Phases per hop, in the order they actually run:
-  1.  pre_commands             — version-specific shell commands (warn on failure)
+Phases, in the order they run:
+  1.  pre_commands             — passed in directly (from Jenkins textbox)
   2.  download                 — new package via aria2c
   3.  extract                  — new package via pigz/tar
   4.  create_config            — copy template, patch fields from old config
-      config_patches           — version-specific config.yaml field edits
-                                  (warn on failure), e.g. storageClass
-                                  provisioner renames between versions
   5.  copy_radm                — new radm → /usr/bin/
   6.  radm dependency          — always same, NEW package only
-      after_radm_dependency    — version-specific shell commands (warn on failure)
+      after_radm_dependency_commands — passed in directly (from Jenkins textbox)
   7.  wait elasticsearch       — wait for green
   8.  radm application         — always same, NEW package only
-      after_radm_application   — version-specific shell commands (warn on failure)
-  9.  post_commands            — version-specific shell commands (warn on failure),
-                                  runs right before radm cluster
-  10. radm cluster             — NEW package only (single pass -- there is
-                                  no separate "old package" radm cluster
-                                  pass; every radm command in this engine
-                                  runs against dst_extract_dir/new config)
-      after_radm_cluster       — version-specific shell commands (warn on failure)
+      after_radm_application_commands — passed in directly (from Jenkins textbox)
+  9.  radm cluster             — NEW package only (single pass)
 """
 
 import re
 import time
-from lib.upgrade.hops import get_hop
 
 # ── Wait policies ─────────────────────────────────────────────────────────────
-# NOTE: these govern the POST-command pod-polling step only, same as
-# lib/controller/bringup.py's PHASE_WAIT. They do NOT affect the radm
-# command timeouts themselves (those are set individually in each phase
-# method below -- e.g. _radm_dependency's ssh.run(..., timeout=1800)).
-#
-# Reduced to match bringup.py's already-reduced values. These pods either
-# stabilize within a few minutes (the common case) or they're stuck in a
-# genuine CrashLoopBackOff that won't resolve no matter how long we wait --
-# in the latter case, waiting the old 25/40/41-minute ceilings just burns
-# time without changing the outcome, since a permanently-crashlooping pod
-# doesn't become healthy by waiting longer. TestPostUpgradeHealth /
-# TestPostInstallHealth / regression / smoke tests still strictly check
-# every pod afterward and will correctly fail the build if something is
-# really broken -- this change only affects how long we wait before moving
-# on to that real verification step.
 PHASE_WAIT = {
     "radm_dependency":  {"interval": 20, "max_wait": 600},
     "radm_application": {"interval": 20, "max_wait": 800},
@@ -55,75 +45,84 @@ PHASE_WAIT = {
     "elasticsearch":    {"interval": 30, "max_wait": 600},
 }
 
-S3_BASE = "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com"
-
 
 class UpgradeEngine:
 
     def __init__(
         self,
         ssh_client,
-        src_version:     str,
-        dst_version:     str,
-        src_package:     str,
-        dst_package:     str,
-        dst_package_url: str = "",
-        install_dir:     str = "/opt/rafay",
-        star_domain:     str = "",
+        src_package_url: str,
+        dst_package_url: str,
+        install_dir: str = "/opt/rafay",
+        star_domain: str = "",
         nsg_manager=None,
+        pre_commands: list = None,
+        after_radm_dependency_commands: list = None,
+        after_radm_application_commands: list = None,
     ):
         self.ssh         = ssh_client
-        self.src_version = src_version
-        self.dst_version = dst_version
-        self.src_package = src_package
-        self.dst_package = dst_package
         self.install_dir = install_dir
         self.star_domain = star_domain
         self.nsg         = nsg_manager
 
-        self.src_extract_dir = f"{install_dir}/{src_package.replace('.tar.gz', '')}"
-        self.dst_extract_dir = f"{install_dir}/{dst_package.replace('.tar.gz', '')}"
-        self.dst_package_url = dst_package_url or self._build_url(dst_package)
+        self.pre_commands = pre_commands or []
+        self.after_radm_dependency_commands = after_radm_dependency_commands or []
+        self.after_radm_application_commands = after_radm_application_commands or []
+
+        # Package name is JUST the URL's last path segment -- a plain
+        # string split, not a version-parsing regex. This is safe
+        # regardless of naming convention (RC suffixes, dash-vs-dot,
+        # differing prefixes -- none of it matters here).
+        self.src_package_url = src_package_url
+        self.dst_package_url = dst_package_url
+        self.src_package = src_package_url.rsplit("/", 1)[-1]
+        self.dst_package = dst_package_url.rsplit("/", 1)[-1]
+
+        self.src_extract_dir = f"{install_dir}/{self.src_package.replace('.tar.gz', '')}"
+        self.dst_extract_dir = f"{install_dir}/{self.dst_package.replace('.tar.gz', '')}"
+
+        # Cosmetic only -- best-effort, used solely in print()/log output.
+        # No decision in this class reads these values.
+        self.src_version = self._cosmetic_version_label(self.src_package)
+        self.dst_version = self._cosmetic_version_label(self.dst_package)
+
+    @staticmethod
+    def _cosmetic_version_label(package_name: str) -> str:
+        """
+        Best-effort label for logs only -- e.g. "rafay-airgapped-controller-
+        v3.1-40-1.tar.gz" -> "3.1-40-1". Falls back to the full package
+        name if nothing matches. Never used for any control-flow decision,
+        so a wrong/partial match here has zero functional impact -- it
+        only affects how readable the console log is.
+        """
+        m = re.search(r'v?([\d.]+(?:-\d+)*)\.tar\.gz', package_name)
+        return m.group(1) if m else package_name
 
     # ── Public entry point ────────────────────────────────────────────────────
 
     def run(self):
-        hop = get_hop(self.src_version, self.dst_version)
-
         print("\n" + "═" * 60)
         print(f"[upgrade] Starting controller upgrade")
-        print(f"[upgrade]   {self.src_version} → {self.dst_version}")
-        print(f"[upgrade]   src : {self.src_extract_dir}")
-        print(f"[upgrade]   dst : {self.dst_extract_dir}")
-        print(f"[upgrade]   url : {self.dst_package_url}")
+        print(f"[upgrade]   src : {self.src_package} ({self.src_version})")
+        print(f"[upgrade]   dst : {self.dst_package} ({self.dst_version})")
         print("═" * 60 + "\n")
 
-        # 1. Pre-commands (warn on failure)
-        self._run_commands("pre", hop.get("pre_commands", []))
+        self._run_commands("pre", self.pre_commands)
 
-        # 2. Download + setup (fatal on failure)
         self._phase("download_new_package",  self._download_new_package)
         self._phase("extract_new_package",   self._extract_new_package)
         self._phase("create_upgrade_config", self._create_upgrade_config)
-        self._apply_config_patches(hop.get("config_patches", []))
         self._phase("copy_new_radm",         self._copy_new_radm)
 
-        # 3. radm dependency (new package only), then its hook
         self._phase("radm_dependency", self._radm_dependency)
-        self._run_commands("after_radm_dependency", hop.get("after_radm_dependency", []))
+        self._run_commands("after_radm_dependency", self.after_radm_dependency_commands)
 
         self._phase("wait_elasticsearch", self._wait_elasticsearch)
 
-        # 4. radm application (new package only), then its hook
         self._phase("radm_application", self._radm_application)
-        self._run_commands("after_radm_application", hop.get("after_radm_application", []))
+        self._run_commands("after_radm_application", self.after_radm_application_commands)
 
-        # 5. post_commands run right before the single radm cluster call
-        self._run_commands("post", hop.get("post_commands", []))
-
-        # 6. radm cluster (new package only -- no old-package pass)
         self._phase("radm_cluster", self._radm_cluster)
-        self._run_commands("after_radm_cluster", hop.get("after_radm_cluster", []))
 
         print("\n" + "═" * 60)
         print(f"[upgrade] ✅ Upgrade complete: {self.src_version} → {self.dst_version}")
@@ -132,7 +131,6 @@ class UpgradeEngine:
     # ── Runners ───────────────────────────────────────────────────────────────
 
     def _phase(self, name: str, fn):
-        """Run a phase — stops upgrade on failure."""
         print(f"\n[upgrade] ── Phase: {name} " + "─" * max(0, 40 - len(name)))
         try:
             fn()
@@ -142,75 +140,32 @@ class UpgradeEngine:
 
     def _run_commands(self, cmd_type: str, commands: list):
         """
-        Run pre/post/after_radm_* shell commands for this hop.
-        Warns on failure — never stops the upgrade.
-        Commands ending with || true never fail by design.
+        Warns on failure -- never stops the upgrade. These commands come
+        straight from a Jenkins textbox with no review, so treating any
+        one line's failure as fatal would make one typo abort an entire
+        real upgrade run -- warn-and-continue matches how pre/post
+        commands have always behaved in this engine.
         """
         if not commands:
-            print(f"[upgrade] No {cmd_type}_commands for this hop")
+            print(f"[upgrade] No {cmd_type} commands provided")
             return
-
-        print(f"\n[upgrade] ── {cmd_type.upper()}_COMMANDS ({len(commands)} total) " + "─" * 20)
+        print(f"\n[upgrade] ── {cmd_type.upper()} COMMANDS ({len(commands)} total) " + "─" * 20)
         for i, cmd in enumerate(commands, 1):
-            # Show a short label (first 60 chars of command)
             label = cmd.strip()[:60] + ("..." if len(cmd.strip()) > 60 else "")
             print(f"[upgrade] [{i}/{len(commands)}] {label}")
             try:
                 out, rc = self.ssh.run(cmd, timeout=120)
-                if rc == 0:
-                    print(f"[upgrade] ✓")
-                else:
-                    print(f"[upgrade] ⚠ WARNING (exit {rc}): {out[-150:]} — continuing")
+                print(f"[upgrade] ✓" if rc == 0 else f"[upgrade] ⚠ WARNING (exit {rc}): {out[-150:]} — continuing")
             except Exception as e:
                 print(f"[upgrade] ⚠ WARNING: {e} — continuing")
 
-    def _apply_config_patches(self, patches: list):
-        """
-        Run hop-specific field-level edits against the NEW config.yaml,
-        right after create_upgrade_config copies the old config forward as
-        a base. This is for version-specific config field changes that
-        must land in config.yaml BEFORE any radm command reads it --
-        e.g. a storageClass provisioner rename between versions -- as
-        opposed to pre/post_commands, which run kubectl/shell commands
-        against the live cluster rather than editing a file.
-
-        Each command in the list is a template containing the literal
-        substring "{config}", which gets replaced with the actual new
-        config.yaml path before running. Same warn-on-failure semantics
-        as pre/post_commands -- end each command with || true unless a
-        failure here should stop the upgrade.
-        """
-        if not patches:
-            print(f"[upgrade] No config_patches for this hop")
-            return
-
-        new_config = f"{self.dst_extract_dir}/config.yaml"
-        print(f"\n[upgrade] ── CONFIG_PATCHES ({len(patches)} total) " + "─" * 20)
-        for i, cmd_template in enumerate(patches, 1):
-            cmd   = cmd_template.format(config=new_config)
-            label = cmd.strip()[:60] + ("..." if len(cmd.strip()) > 60 else "")
-            print(f"[upgrade] [{i}/{len(patches)}] {label}")
-            try:
-                out, rc = self.ssh.run(cmd, timeout=60)
-                if rc == 0:
-                    print(f"[upgrade] ✓")
-                else:
-                    print(f"[upgrade] ⚠ WARNING (exit {rc}): {out[-150:]} — continuing")
-            except Exception as e:
-                print(f"[upgrade] ⚠ WARNING: {e} — continuing")
-
-    # ── Phase implementations ─────────────────────────────────────────────────
+    # ── Phase implementations (unchanged from previous version) ──────────────
 
     def _download_new_package(self):
         tar_path = f"{self.install_dir}/{self.dst_package}"
-
-        # Skip if already downloaded
-        check, _ = self.ssh.run(
-            f"test -f {tar_path} && test ! -f {tar_path}.aria2 && echo COMPLETE || echo MISSING"
-        )
+        check, _ = self.ssh.run(f"test -f {tar_path} && test ! -f {tar_path}.aria2 && echo COMPLETE || echo MISSING")
         if "COMPLETE" in check:
-            size_out, _ = self.ssh.run(f"du -sh {tar_path} | awk '{{print $1}}'")
-            print(f"[download_new_package] already downloaded ({size_out.strip()}) — skipping")
+            print(f"[download_new_package] already downloaded — skipping")
             return
 
         if self.nsg:
@@ -219,7 +174,7 @@ class UpgradeEngine:
             time.sleep(30)
 
         aria2c_out, _ = self.ssh.run("which aria2c")
-        aria2c_bin    = aria2c_out.strip() or "/usr/bin/aria2c"
+        aria2c_bin = aria2c_out.strip() or "/usr/bin/aria2c"
 
         print(f"[download_new_package] Downloading: {self.dst_package_url}")
         out, rc = self.ssh.run(
@@ -227,79 +182,45 @@ class UpgradeEngine:
             f"--connect-timeout=30 -d {self.install_dir} {self.dst_package_url} 2>&1",
             timeout=1800
         )
-
         if self.nsg:
             self.nsg.detach()
             print("[download_new_package] NSG detached ✓")
 
         assert rc == 0, f"aria2c download failed (exit {rc}): {out[-300:]}"
-        size_out, _ = self.ssh.run(f"du -sh {tar_path} | awk '{{print $1}}'")
-        print(f"[download_new_package] Downloaded {size_out.strip()} ✓")
+        print(f"[download_new_package] Downloaded ✓")
 
     def _extract_new_package(self):
-        # Skip if already extracted
-        check, _ = self.ssh.run(
-            f"test -d {self.dst_extract_dir} && echo EXISTS || echo MISSING"
-        )
+        check, _ = self.ssh.run(f"test -d {self.dst_extract_dir} && echo EXISTS || echo MISSING")
         if "EXISTS" in check:
             print(f"[extract_new_package] already extracted: {self.dst_extract_dir}")
             return
 
         tar_path = f"{self.install_dir}/{self.dst_package}"
         _, pigz_rc = self.ssh.run("which pigz 2>/dev/null")
-
-        if pigz_rc == 0:
-            cmd = f"cd {self.install_dir} && sudo tar -I pigz -xf {tar_path} 2>&1 && echo EXTRACTED"
-            print("[extract_new_package] Extracting with pigz ...")
-        else:
-            cmd = f"cd {self.install_dir} && sudo tar -xf {tar_path} 2>&1 && echo EXTRACTED"
-            print("[extract_new_package] Extracting with tar ...")
+        cmd = (f"cd {self.install_dir} && sudo tar -I pigz -xf {tar_path} 2>&1 && echo EXTRACTED" if pigz_rc == 0
+               else f"cd {self.install_dir} && sudo tar -xf {tar_path} 2>&1 && echo EXTRACTED")
 
         out, rc = self.ssh.run(cmd, timeout=3600)
         assert rc == 0 and "EXTRACTED" in out, f"Extraction failed: {out[-300:]}"
         print(f"[extract_new_package] Extracted to {self.dst_extract_dir} ✓")
 
     def _create_upgrade_config(self):
-        """
-        Build new config.yaml by copying old config.yaml entirely,
-        then updating only archive-directory to new package path.
-
-        Everything else — star-domain, ha, size, type, storageClass etc
-        stays exactly as in the old config.
-        """
         old_config = f"{self.src_extract_dir}/config.yaml"
         new_config = f"{self.dst_extract_dir}/config.yaml"
 
-        # Copy old config.yaml as base — retains ALL fields including storageClass
         self.ssh.run(f"sudo cp {old_config} {new_config}")
-
-        # Update only archive-directory → new package path
         self.ssh.run(f"sudo sed -i 's|archive-directory:.*|archive-directory: RAFAY_PH|' {new_config}")
         self.ssh.run(f"sudo sed -i 's|archive-directory: RAFAY_PH|archive-directory: {self.dst_extract_dir}|' {new_config}")
-
-        print(f"[create_upgrade_config] ✓")
-        print(f"  base              : copied from {self.src_version}/config.yaml")
-        print(f"  archive-directory : {self.dst_extract_dir}")
-        print(f"  storageClass      : unchanged from {self.src_version}")
+        print(f"[create_upgrade_config] ✓ archive-directory: {self.dst_extract_dir}")
 
     def _copy_new_radm(self):
         out, rc = self.ssh.run(
-            f"sudo cp {self.dst_extract_dir}/radm /usr/bin/radm && "
-            f"sudo chmod +x /usr/bin/radm && echo OK"
+            f"sudo cp {self.dst_extract_dir}/radm /usr/bin/radm && sudo chmod +x /usr/bin/radm && echo OK"
         )
         assert rc == 0 and "OK" in out, f"radm copy failed: {out}"
         print("[copy_new_radm] new radm → /usr/bin/radm ✓")
 
     def _radm_dependency(self):
-        """
-        Run: sudo ./radm dependency --config config.yaml (NEW package dir)
-
-        Command timeout is 1800s (30 min), not 600s -- 10 minutes proved too
-        tight under normal OCI resource contention / image pull latency (see
-        the same fix in lib/controller/bringup.py's _radm_dependency: a run
-        was observed still actively creating Helm resources when a 600s
-        timeout fired mid-apply).
-        """
         print("[radm_dependency] Running ...")
         out, rc = self.ssh.run(
             f"cd {self.dst_extract_dir} && sudo ./radm dependency --config config.yaml 2>&1",
@@ -309,22 +230,18 @@ class UpgradeEngine:
         self._poll_pods(PHASE_WAIT["radm_dependency"], "after radm dependency")
 
     def _wait_elasticsearch(self):
-        cfg      = PHASE_WAIT["elasticsearch"]
+        cfg = PHASE_WAIT["elasticsearch"]
         deadline = time.time() + cfg["max_wait"]
-        attempt  = 0
-        print(f"[wait_elasticsearch] Waiting for es+kibana green ...")
+        attempt = 0
         while time.time() < deadline:
             attempt += 1
             out, rc = self.ssh.run("kubectl get es,kibana -A --no-headers 2>/dev/null || echo NOT_READY")
             if rc == 0 and "NOT_READY" not in out and out.strip():
-                lines     = [l for l in out.splitlines() if l.strip()]
+                lines = [l for l in out.splitlines() if l.strip()]
                 not_green = [l for l in lines if "green" not in l.lower()]
-                print(f"[wait_elasticsearch] attempt {attempt}: {len(lines)-len(not_green)}/{len(lines)} green")
                 if not not_green:
                     print("[wait_elasticsearch] all green ✓")
                     return
-            else:
-                print(f"[wait_elasticsearch] attempt {attempt}: not ready ...")
             time.sleep(cfg["interval"])
         print(f"[wait_elasticsearch] ⚠ Timeout — continuing anyway")
 
@@ -338,14 +255,7 @@ class UpgradeEngine:
         self._poll_pods(PHASE_WAIT["radm_application"], "after radm application")
 
     def _radm_cluster(self):
-        """
-        Run: sudo ./radm cluster --config config.yaml -- NEW package dir only.
-
-        There is no separate "old package" radm cluster pass in this
-        engine. Every radm command (dependency, application, cluster) runs
-        exactly once, against dst_extract_dir / the new config.yaml.
-        """
-        print(f"[radm_cluster] Running from {self.dst_version} dir ...")
+        print(f"[radm_cluster] Running from {self.dst_extract_dir} ...")
         out, rc = self.ssh.run_stream(
             f"cd {self.dst_extract_dir} && sudo ./radm cluster --config config.yaml 2>&1",
             timeout=2400, prefix="[radm cluster]",
@@ -353,30 +263,21 @@ class UpgradeEngine:
         assert rc == 0, f"radm cluster failed (exit {rc}): {out[-300:]}"
         self._poll_pods(PHASE_WAIT["radm_cluster"], "after radm cluster")
 
-    # ── Poll helper ───────────────────────────────────────────────────────────
-
     def _poll_pods(self, cfg: dict, label: str):
-        deadline     = time.time() + cfg["max_wait"]
-        attempt      = 0
+        deadline = time.time() + cfg["max_wait"]
+        attempt = 0
         stable_count = 0
-        prev_total   = 0
-
+        prev_total = 0
         while time.time() < deadline:
             attempt += 1
-            out, rc = self.ssh.run(
-                "kubectl get pods -A --no-headers 2>/dev/null || "
-                "/usr/local/bin/kubectl get pods -A --no-headers 2>&1"
-            )
+            out, rc = self.ssh.run("kubectl get pods -A --no-headers 2>/dev/null || /usr/local/bin/kubectl get pods -A --no-headers 2>&1")
             if rc != 0:
-                print(f"[poll_pods][{label}] kubectl not ready (attempt {attempt}) ...")
                 time.sleep(cfg["interval"])
                 continue
-
-            lines     = [l for l in out.splitlines() if l.strip()]
-            total     = len(lines)
+            lines = [l for l in out.splitlines() if l.strip()]
+            total = len(lines)
             not_ready = [l for l in lines if "Running" not in l and "Completed" not in l]
-            print(f"[poll_pods][{label}] attempt {attempt}: {total-len(not_ready)}/{total} Running")
-
+            print(f"[poll_pods][{label}] attempt {attempt}: {total - len(not_ready)}/{total} Running")
             if not not_ready and total > 0:
                 stable_count = stable_count + 1 if total == prev_total else 0
                 if stable_count >= 2:
@@ -384,19 +285,6 @@ class UpgradeEngine:
                     return
             else:
                 stable_count = 0
-
             prev_total = total
             time.sleep(cfg["interval"])
-
         print(f"[poll_pods][{label}] Timeout after {cfg['max_wait']}s")
-
-    # ── Helper ────────────────────────────────────────────────────────────────
-
-    def _build_url(self, package_name: str) -> str:
-        match = re.search(r'v([\d.]+)-\d+\.tar\.gz', package_name)
-        if match:
-            return f"{S3_BASE}/{match.group(1)}/{package_name}"
-        raise ValueError(
-            f"Cannot auto-build URL from: {package_name}\n"
-            f"Pass --dst-package-url for dev/custom packages."
-        )

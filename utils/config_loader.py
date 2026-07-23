@@ -7,13 +7,18 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
-VALID_SIZES   = {"S", "M", "L"}
-VALID_OS      = {"ubuntu24", "rhel8", "rhel9"}
-# Size S is non-HA only; Size L is HA only
+VALID_SIZES   = {"S", "M", "L", "POC"}
+VALID_OS      = {"ubuntu24", "rhel8", "rhel9", "rhel10"}
+# S/M/L are HA-only; POC is the only Non-HA option (per Jenkinsfile's
+# controller_size description: "POC → Non-HA | S/M/L → HA only", added
+# 2026-07-22). NOTE: POC's actual cpu/memory values below are a PLACEHOLDER
+# -- not yet confirmed with the team, see resolve_size_profile() and the
+# cpu/memory_gb properties below.
 SIZE_HA_RULES = {
-    "S": [True],  # S → both
-    "M": [True], # M → both
-    "L": [True],        # L → HA only
+    "S":   [True],
+    "M":   [True],
+    "L":   [True],
+    "POC": [False],
 }
 
 
@@ -59,11 +64,15 @@ class ControllerProfile:
 
     @property
     def cpu(self) -> int:
-        return {"S": 16, "M": 24, "L": 48}[self.controller_size]
+        # POC value is a PLACEHOLDER (4 CPU) -- not yet confirmed with the
+        # team. Update once the real POC spec is known.
+        return {"S": 16, "M": 24, "L": 48, "POC": 4}[self.controller_size]
 
     @property
     def memory_gb(self) -> int:
-        return {"S": 64, "M": 64, "L": 192}[self.controller_size]
+        # POC value is a PLACEHOLDER (16GB) -- not yet confirmed with the
+        # team. Update once the real POC spec is known.
+        return {"S": 64, "M": 64, "L": 192, "POC": 16}[self.controller_size]
 
     def summary(self) -> str:
         return (
@@ -178,17 +187,20 @@ def resolve_size_profile(controller_size: str) -> tuple:
     dev.yaml only needs to say controller_size: S | M | L
 
     Size rules:
-      S  →  32 OCPUs / 64GB   — Non-HA only
-      M  →  32 OCPUs / 64GB   — HA or Non-HA
-      L  →  128 OCPUs / 192GB — HA only
+      S    →  16 OCPUs / 64GB   — HA only
+      M    →  24 OCPUs / 64GB   — HA only
+      L    →  48 OCPUs / 192GB  — HA only
+      POC  →  4 OCPUs / 16GB    — Non-HA only (PLACEHOLDER -- not yet confirmed)
 
     Returns:
         (ocpus: float, memory_gb: float)
     """
+    # POC value is a PLACEHOLDER -- not yet confirmed with the team.
     SIZE_PROFILES = {
-        "S": (16.0,  64.0),
-        "M": (24.0,  64.0),
-        "L": (48.0, 192.0),
+        "S":   (16.0,  64.0),
+        "M":   (24.0,  64.0),
+        "L":   (48.0, 192.0),
+        "POC": (4.0,   16.0),
     }
 
     if controller_size not in SIZE_PROFILES:
@@ -206,119 +218,57 @@ def resolve_size_profile(controller_size: str) -> tuple:
 
 import re as _re
 
-# Two separate S3 locations, two separate path conventions:
-#
-#   PROD (official releases):
-#     https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/{version}/{name}
-#     e.g. .../3.1/rafay-airgapped-controller-v3.1-40.tar.gz
-#
-#   DEV / RC (release-candidate / automation builds):
-#     https://dev-rafay-controller.s3.us-west-1.amazonaws.com/Automation/{name}
-#     e.g. .../Automation/rafay-airgapped-controller-v3.1-40-RC48541-1-35.tar.gz
-#     -- flat "Automation/" prefix, NO version subfolder.
-#
-# Which bucket a name belongs to is detected by the presence of an
-# "-RC<digits>" segment (e.g. "-RC48541") -- that's the signal that
-# distinguishes an RC/dev build from a prod release build.
-PROD_S3_BASE = "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com"
-DEV_S3_BASE  = "https://dev-rafay-controller.s3.us-west-1.amazonaws.com/Automation"
-
-RC_PATTERN = _re.compile(r"-RC\d+")
-
-# Best-effort version/build extraction -- NOT a strict full-name validator.
-# Uses .search() (not .match()/fullmatch()) so it finds "v{version}-{build}"
-# wherever it appears in the name and ignores anything after it -- this is
-# what lets RC/dev builds like:
-#   rafay-airgapped-controller-v3.1-40-RC48541-1-35.tar.gz
-# still resolve to version=3.1, build=40, rather than being rejected outright
-# for having extra suffix content after the build number.
-#
-# The 'v' prefix on the version is optional -- all of these match:
-#   rafay-airgapped-controller-v3.1-39.tar.gz          -> 3.1 / 39
-#   rafay-airgapped-controller-4.2-1.tar.gz            -> 4.2 / 1
-#   rafay-airgapped-controller-v3.1-40-RC48541-1-35... -> 3.1 / 40
-PACKAGE_PATTERN = _re.compile(r"rafay-airgapped-controller-v?([\d.]+)-(\d+)")
-
 
 @dataclass
 class PackageProfile:
     """
-    Represents a controller installation package.
+    Represents a controller installation/upgrade package.
 
-    Built from the 'package:' section of dev.yaml.
-    The download URL is derived automatically from the package name when it
-    matches the standard rafay-airgapped-controller-v{version}-{build}...
-    convention (RC/dev suffixes after the build number are fine). For any
-    other .tar.gz package name -- one that doesn't match closely enough to
-    extract a version -- pass --package-url (or --dst-package-url) explicitly
-    so the download URL doesn't have to be guessed.
+    UPDATED per team design review (2026-07-22): package_url is now the
+    ONLY input -- no more --package-name fallback, no PACKAGE_PATTERN
+    regex-based version/build extraction, no RC_PATTERN/dev-vs-prod bucket
+    guessing (PROD_S3_BASE/DEV_S3_BASE routing is gone entirely). Every
+    one of those mechanisms existed to compensate for NOT having a full
+    URL up front; now that Jenkins always supplies one directly
+    (src_package_url / dst_package_url on the two upgrade-capable
+    run_modes), none of that guessing is needed -- or wanted, since it's
+    exactly what caused the earlier bugs where "-2"/"-1" suffixes got
+    silently dropped, and where a real dev-bucket package with no "-RC"
+    marker got misrouted to the prod bucket.
 
-    The only HARD requirement on the name itself is that it ends in .tar.gz.
-    Everything else (version, build) is best-effort metadata used for
-    convenience (auto-deriving the S3 URL, populating reports) -- it is not
-    a gate on whether the package can be used.
+    `name` is derived purely as the URL's last path segment -- a plain
+    string split, not a version-parsing regex -- so it's reliable
+    regardless of naming convention (RC suffixes, dash-vs-dot, differing
+    prefixes like "rafay-v3-airgap-controller-" vs
+    "rafay-airgapped-controller-" -- none of it matters here, since
+    nothing is extracted FROM the name; it's just used verbatim for
+    tar_path/extract_dir).
 
-    Example package names (the 'v' prefix on the version is optional):
-        rafay-airgapped-controller-v3.1-39.tar.gz
-        → version = 3.1
-        → build   = 39
-        → url     = https://rafay-airgap-controller.s3.../3.1/rafay-airgapped-controller-v3.1-39.tar.gz
-
-        rafay-airgapped-controller-4.2-1.tar.gz
-        → version = 4.2
-        → build   = 1
-
-        rafay-airgapped-controller-v3.1-40-RC48541-1-35.tar.gz
-        → version = 3.1
-        → build   = 40
-        → url     = https://dev-rafay-controller.s3.us-west-1.amazonaws.com/Automation/rafay-airgapped-controller-v3.1-40-RC48541-1-35.tar.gz
-        (detected as an RC/dev build via the "-RC<digits>" segment -- routed
-        to the dev bucket's flat Automation/ prefix, not the prod versioned
-        path. RC suffix is ignored for version/build extraction, but is kept
-        as-is in `name` / `tar_path` / `extract_dir` -- the RC identifier
-        is part of the actual filename on disk and in S3, so it must not
-        be stripped there)
+    `version` is a best-effort COSMETIC label only, used purely to make
+    print()/report output readable -- e.g.
+    "rafay-airgapped-controller-v3.1-40-1.tar.gz" -> "3.1-40-1". Nothing
+    in this class or its callers makes any decision based on this value;
+    a wrong or empty label has zero functional impact. This mirrors
+    lib/upgrade/upgrade_engine.py's UpgradeEngine._cosmetic_version_label,
+    for the same reason.
     """
-    name: str           # e.g. rafay-airgapped-controller-v3.1-39.tar.gz
-    install_dir: str    # e.g. /opt/rafay
-    url: str = ""       # auto-derived if possible, else must be passed in
+    url: str
+    install_dir: str
 
     def __post_init__(self):
-        # The only hard requirement: this has to be a .tar.gz file. Everything
-        # else about the name is best-effort.
-        if not self.name.endswith(".tar.gz"):
-            raise ValueError(
-                f"Package name '{self.name}' must end with .tar.gz"
-            )
-
-        m = PACKAGE_PATTERN.search(self.name)
-        if m:
-            self.version = m.group(1)   # e.g. "3.1"
-            self.build   = m.group(2)   # e.g. "40"
-        else:
-            # Doesn't match the known naming convention closely enough to
-            # extract a version -- that's fine, but we can no longer
-            # auto-derive the S3 URL below, so an explicit url becomes
-            # mandatory in that case.
-            self.version = ""
-            self.build   = ""
-
-        # Derive URL from name if not explicitly set.
-        # RC/dev builds go to the flat Automation/ prefix (no version
-        # subfolder); prod releases go to the versioned prod path.
         if not self.url:
-            if RC_PATTERN.search(self.name):
-                self.url = f"{DEV_S3_BASE}/{self.name}"
-            elif self.version:
-                self.url = f"{PROD_S3_BASE}/{self.version}/{self.name}"
-            else:
-                raise ValueError(
-                    f"Could not auto-derive a version from package name "
-                    f"'{self.name}' (expected something containing "
-                    f"'rafay-airgapped-controller-[v]{{version}}-{{build}}').\n"
-                    f"Pass --package-url (or --dst-package-url) explicitly "
-                    f"for package names that don't follow this convention."
-                )
+            raise ValueError("PackageProfile requires a non-empty url.")
+        if not self.url.endswith(".tar.gz"):
+            raise ValueError(f"Package URL '{self.url}' must end with .tar.gz")
+
+        self.name = self.url.rsplit("/", 1)[-1]
+        self.version = self._cosmetic_version_label(self.name)
+
+    @staticmethod
+    def _cosmetic_version_label(package_name: str) -> str:
+        """Best-effort label for logs/reports only -- see class docstring."""
+        m = _re.search(r'v?([\d.]+(?:-\d+)*)\.tar\.gz', package_name)
+        return m.group(1) if m else ""
 
     @property
     def extract_dir(self) -> str:
@@ -333,42 +283,31 @@ class PackageProfile:
     def summary(self) -> str:
         return (
             f"Package | name={self.name} | "
-            f"version={self.version or 'unknown'} | build={self.build or 'unknown'} | "
+            f"version={self.version or 'unknown'} | "
             f"url={self.url}"
         )
 
 
-def load_package_profile(cfg: dict, package_name: Optional[str] = None,
-                          package_url: Optional[str] = None) -> PackageProfile:
+def load_package_profile(cfg: dict, package_url: str) -> PackageProfile:
     """
-    Build a PackageProfile from the 'package:' section of dev.yaml.
+    Build a PackageProfile from a full package URL.
 
-    Priority: CLI --package-url > CLI --package-name > env var > dev.yaml value.
-    If package_url is provided, name is extracted from URL automatically.
+    UPDATED per team design review (2026-07-22): package_url is now
+    REQUIRED -- no --package-name fallback, no dev.yaml package.name
+    fallback, no CONTROLLER_PACKAGE env var fallback. Jenkins always
+    supplies a full URL directly now (conftest.py's package_profile
+    fixture raises before even calling this if --package-url wasn't
+    passed at all).
     """
-    pkg_cfg = cfg.get("package", {})
-
-    # If URL provided, extract name from it
-    if package_url and not package_name:
-        package_name = package_url.split("/")[-1]
-
-    name = (
-        package_name
-        or os.environ.get("CONTROLLER_PACKAGE")
-        or pkg_cfg.get("name", "")
-    )
-    if not name:
+    if not package_url:
         raise ValueError(
-            "No package name set.\n"
-            "Set 'package.name' in dev.yaml or pass --package-name on the CLI.\n"
-            "Example: rafay-airgapped-controller-v3.1-39.tar.gz"
+            "package_url is required.\n"
+            "Pass the full package URL, e.g.:\n"
+            "  https://.../rafay-airgapped-controller-v3.1-39.tar.gz"
         )
 
-    # URL priority: CLI --package-url > dev.yaml url > auto-derived from name
-    url = package_url or pkg_cfg.get("url", "")
-
+    pkg_cfg = cfg.get("package", {})
     return PackageProfile(
-        name=name,
+        url=package_url,
         install_dir=pkg_cfg.get("install_dir", "/opt/rafay"),
-        url=url,
     )

@@ -1,13 +1,31 @@
 """Root conftest — CLI options, session fixtures, controller profile injection."""
 
 import os
-import re
+import base64
 import pytest
 from utils.config_loader import (
     load_controller_profile,
     load_config,
     load_package_profile,
 )
+
+
+def decode_commands(b64_str: str) -> list:
+    """
+    Decodes a base64-encoded multi-line string (from a Jenkins textarea)
+    into a list of commands, one per non-blank line. Returns [] for
+    None/empty input -- callers can pass the result straight to
+    UpgradeEngine's pre_commands / after_radm_dependency_commands /
+    after_radm_application_commands with no further checking.
+    """
+    if not b64_str:
+        return []
+    try:
+        text = base64.b64decode(b64_str).decode("utf-8")
+    except Exception as e:
+        print(f"[conftest] WARNING: could not decode patch commands ({e}) — treating as empty")
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 def pytest_addoption(parser):
@@ -17,32 +35,52 @@ def pytest_addoption(parser):
                      help="Force fresh VM provisioning via Terraform, overriding dev.yaml's controller.provision value")
     parser.addoption("--ssh-key",         default=None,   help="Path to SSH private key (.pem)")
     parser.addoption("--ssh-user",        default=None,   help="SSH username (default: ubuntu)")
-    parser.addoption("--controller-size", default=None,   help="S | M | L")
+    parser.addoption("--controller-size", default=None,   help="S | M | L | POC")
     parser.addoption("--ha",              default=None,   help="true | false")
-    parser.addoption("--os-type",         default=None,   help="ubuntu24 | rhel8 | rhel9")
+    parser.addoption("--os-type",         default=None,   help="ubuntu24 | rhel8 | rhel9 | rhel10")
     parser.addoption("--build-no",        default=None,   help="Build number -> VM display name e.g. 42")
     parser.addoption("--keep-vm",         action="store_true", default=False,
                      help="Skip terraform destroy after session")
-    parser.addoption("--package-name",    default=None,   help="e.g. rafay-airgapped-controller-v3.1-39.tar.gz")
-    parser.addoption("--package-url",     default=None,   help="Full S3 URL for package (optional — auto-built for prod)")
+
+    # ── Bringup package -- URL only, no name-based derivation ────────────────
+    # UPDATED per team design review (2026-07-22): --package-name and the
+    # is_dev-checkbox/RC-heuristic bucket-guessing were dropped entirely.
+    # Jenkins always passes a full, exact URL now -- nothing here parses
+    # the filename for meaning.
+    parser.addoption("--package-url",     default=None,   help="Full URL for the bringup install package")
+
     parser.addoption("--secondary-ips",   default=None,   help="Comma-separated IPs of secondary nodes e.g. 1.2.3.4,5.6.7.8")
     parser.addoption("--secondary-ids",   default=None,   help="Comma-separated OCI instance IDs of secondary nodes")
     parser.addoption("--controller-instance-id", default=None, help="OCI instance ID of primary node (for NSG in static IP mode)")
     parser.addoption("--skip-bringup",    action="store_true", default=False,
                      help="Skip controller bringup — run validation tests only against existing install")
+
     # ── Upgrade flags ──────────────────────────────────────────────────────────
-    parser.addoption("--src-package",     default=None,
-                     help="Source package e.g. rafay-airgapped-controller-v3.1-39.tar.gz")
-    parser.addoption("--dst-package",     default=None,
-                     help="Dest package e.g. rafay-airgapped-controller-v3.1-40.tar.gz")
+    # UPDATED per team design review (2026-07-22): no more hop chains, no
+    # controller_type, no src-version/dst-version. Always a direct upgrade
+    # from --package-url straight to --dst-package-url -- both full URLs,
+    # zero parsing. See lib/upgrade/upgrade_engine.py's UpgradeEngine: version
+    # strings are now purely cosmetic log labels with no control-flow
+    # depending on them.
     parser.addoption("--dst-package-url", default=None,
-                     help="Full URL for dest package (optional — auto-built for prod)")
-    parser.addoption("--src-version",     default=None,
-                     help="Source version e.g. 3.1-39 (auto-extracted from src-package if not set)")
-    parser.addoption("--dst-version",     default=None,
-                     help="Dest version e.g. 3.1-40 (auto-extracted from dst-package if not set)")
+                     help="Full URL for the destination (upgrade target) package")
     parser.addoption("--skip-upgrade",    action="store_true", default=False,
                      help="Skip upgrade — run validation only")
+
+    # ── Ad-hoc patch commands -- from the three Jenkins checkbox+textarea
+    # pairs. Base64-encoded to survive the trip through a Groovy sh step
+    # without newline/quoting corruption (same pattern already used for
+    # transferring config.yaml content to secondary nodes). These commands
+    # come straight from a Jenkins textbox with no code review --
+    # UpgradeEngine's _run_commands() deliberately warns-and-continues on
+    # failure rather than aborting the whole upgrade over one bad line.
+    parser.addoption("--pre-dependency-commands-b64",    default=None,
+                     help="Base64-encoded commands to run before radm dependency (using new tar)")
+    parser.addoption("--after-dependency-commands-b64",  default=None,
+                     help="Base64-encoded commands to run after radm dependency")
+    parser.addoption("--after-application-commands-b64", default=None,
+                     help="Base64-encoded commands to run after radm application")
+
     # ── Signed cert (Let's Encrypt via Route53 DNS-01) ────────────────────────
     parser.addoption("--signed-cert",     action="store_true", default=False,
                      help="Issue a Let's Encrypt wildcard cert via Route53 DNS-01 "
@@ -275,24 +313,22 @@ def controller_fqdn(request):
 
 @pytest.fixture(scope="session")
 def package_profile(request, raw_config):
-    # For upgrade runs — bringup uses src-package
-    # For bringup-only runs — uses package-name
-    package_name = (
-        request.config.getoption("--src-package")
-        or request.config.getoption("--package-name")
-    )
+    """
+    Bringup install package -- always a full URL now (--package-url).
+    UPDATED per team design review (2026-07-22): no --package-name /
+    --src-package fallback, no name-based derivation of anything. Fails
+    loudly and immediately if --package-url isn't set, rather than
+    silently falling back to guessing a name/URL from partial input.
+    """
     package_url = request.config.getoption("--package-url")
+    if not package_url:
+        raise ValueError(
+            "--package-url is required.\n"
+            "Pass the full URL of the package to install, e.g.:\n"
+            "  --package-url=https://.../rafay-airgapped-controller-v3.1-39.tar.gz"
+        )
 
-    # If URL passed — extract name from URL automatically
-    if package_url and not package_name:
-        package_name = package_url.split("/")[-1]
-        print(f"[conftest] package name extracted from URL: {package_name}")
-
-    profile = load_package_profile(
-        cfg=raw_config,
-        package_name=package_name,
-        package_url=package_url,
-    )
+    profile = load_package_profile(cfg=raw_config, package_url=package_url)
     print(f"\n[conftest] {profile.summary()}")
     return profile
 
@@ -348,29 +384,19 @@ def controller_bringup(
 
 # ── controller_upgrade fixture ────────────────────────────────────────────────
 #
-# NOTE: deliberately NOT autouse anymore.
+# NOTE: deliberately NOT autouse (see original comment history on this) --
+# only fires when a test explicitly requests it, which
+# TestUpgradeExecution.test_upgrade_completes in test_controller_upgrade.py
+# does. Session-scoped, so it still only ever runs once and is cached
+# after that. controller_bringup remains autouse=True, so bringup still
+# always happens first, unconditionally.
 #
-# Previously this fixture was autouse=True, which meant it (along with
-# controller_bringup) fired during the SETUP of the very first test pytest
-# collected in the whole session -- before ANY test body ran, including
-# signup/login in test_console_login.py. That made it structurally
-# impossible to get the sequence:
-#
-#     bringup -> signup/login -> upgrade -> verify old creds still work
-#
-# because the upgrade had already silently completed before signup/login
-# even got a chance to run.
-#
-# Now, this fixture only runs when a test explicitly requests it as a
-# parameter -- which TestUpgradeExecution.test_upgrade_completes in
-# test_controller_upgrade.py already does. Since it's still session-scoped,
-# it still only ever runs ONCE per session (cached after the first request),
-# and any later test that also requests it (or that runs after it in the
-# same session, even without listing it) sees the already-upgraded state --
-# same as before, just no longer forced to happen before every other test.
-#
-# controller_bringup remains autouse=True, so bringup still always happens
-# first, unconditionally, exactly as before.
+# UPDATED per team design review (2026-07-22): no more hop chains, no
+# controller_type, no src-version/dst-version. Always a direct upgrade
+# from --package-url straight to --dst-package-url -- both full URLs,
+# zero parsing. lib/upgrade/hops/ is no longer imported anywhere (confirmed
+# via repo-wide grep -- its only caller was UpgradeEngine.run(), which no
+# longer calls get_hop() at all).
 @pytest.fixture(scope="session")
 def controller_upgrade(
     request,
@@ -381,20 +407,17 @@ def controller_upgrade(
     raw_config,
     controller_bringup,   # ensures bringup runs first
 ):
-    dst_package = request.config.getoption("--dst-package", default=None)
-    src_package = request.config.getoption("--src-package", default=None)
+    dst_package_url = request.config.getoption("--dst-package-url", default=None)
 
-    # Skip if no dst-package — bringup only run. Deliberately checked BEFORE
-    # importing lib.upgrade.upgrade_engine: an import error inside the
-    # upgrade module (missing dependency, stale reference, etc.) must not be
-    # able to break a plain bringup-only run just because it happens to sit
-    # above this check. Only import once we know upgrade is actually requested.
-    if not dst_package:
-        print("[conftest] --dst-package not set — skipping upgrade")
+    # Skip if no dst-package-url — bringup only run. Deliberately checked
+    # BEFORE importing lib.upgrade.upgrade_engine: an import error inside
+    # the upgrade module must not be able to break a plain bringup-only
+    # run just because it happens to sit above this check.
+    if not dst_package_url:
+        print("[conftest] --dst-package-url not set — skipping upgrade")
         yield
         return
 
-    # Skip if --skip-upgrade
     if request.config.getoption("--skip-upgrade"):
         print("[conftest] --skip-upgrade — skipping upgrade")
         yield
@@ -402,16 +425,16 @@ def controller_upgrade(
 
     from lib.upgrade.upgrade_engine import UpgradeEngine
 
-    # Auto-extract versions from package names if not explicitly passed.
-    # 'v' prefix is optional -- matches both rafay-airgapped-controller-v3.1-39.tar.gz
-    # and rafay-airgapped-controller-4.2-1.tar.gz (same fix as PACKAGE_PATTERN
-    # in utils/config_loader.py).
-    def extract_version(pkg):
-        m = re.search(r'v?([\d.]+-\d+)\.tar\.gz', pkg or "")
-        return m.group(1) if m else ""
+    pre_commands = decode_commands(request.config.getoption("--pre-dependency-commands-b64"))
+    after_dependency_commands = decode_commands(request.config.getoption("--after-dependency-commands-b64"))
+    after_application_commands = decode_commands(request.config.getoption("--after-application-commands-b64"))
 
-    src_version = request.config.getoption("--src-version") or extract_version(src_package)
-    dst_version = request.config.getoption("--dst-version") or extract_version(dst_package)
+    if pre_commands:
+        print(f"[conftest] {len(pre_commands)} pre-dependency command(s) supplied via Jenkins")
+    if after_dependency_commands:
+        print(f"[conftest] {len(after_dependency_commands)} after-dependency command(s) supplied via Jenkins")
+    if after_application_commands:
+        print(f"[conftest] {len(after_application_commands)} after-application command(s) supplied via Jenkins")
 
     # Resolve star_domain
     if controller_fqdn:
@@ -423,14 +446,14 @@ def controller_upgrade(
 
     engine = UpgradeEngine(
         ssh_client=ssh_client,
-        src_version=src_version,
-        dst_version=dst_version,
-        src_package=src_package or "",
-        dst_package=dst_package,
-        dst_package_url=request.config.getoption("--dst-package-url") or "",
+        src_package_url=package_profile.url,
+        dst_package_url=dst_package_url,
         install_dir=raw_config.get("package", {}).get("install_dir", "/opt/rafay"),
         star_domain=star_domain,
         nsg_manager=nsg_manager,
+        pre_commands=pre_commands,
+        after_radm_dependency_commands=after_dependency_commands,
+        after_radm_application_commands=after_application_commands,
     )
 
     try:

@@ -1,33 +1,33 @@
 """
 tests/controller/test_controller_upgrade.py
 
-Drives an in-place controller upgrade (src_package -> dst_package) against
-an ALREADY-PROVISIONED controller, using --skip-bringup + --controller-ip
-+ --secondary-ips instead of Terraform-provisioning fresh nodes.
+Drives a direct in-place controller upgrade (src_package_url -> dst_package_url)
+against an ALREADY-PROVISIONED controller, using --skip-bringup +
+--controller-ip + --secondary-ips instead of Terraform-provisioning fresh
+nodes.
 
-Jenkins usage (upgrade_only mode):
+UPDATED per team design review (2026-07-22): no more hop chains, no
+controller_type, no src-version/dst-version. Always a direct upgrade from
+one full package URL straight to another -- see lib/upgrade/upgrade_engine.py's
+UpgradeEngine for why version strings are now purely cosmetic log labels
+with no control-flow depending on them.
+
+Jenkins usage (Upgrade Existing Controller mode):
     pytest tests/controller/test_controller_upgrade.py \
         --skip-bringup \
         --controller-ip=141.148.166.161 \
         --secondary-ips=161.153.50.242,132.226.86.231 \
         --build-no=63 \
-        --src-package=rafay-airgapped-controller-v3.1-39.tar.gz \
-        --dst-package=rafay-airgapped-controller-v3.1-40.tar.gz \
+        --package-url=https://.../rafay-airgapped-controller-v3.1-39.tar.gz \
+        --dst-package-url=https://.../rafay-airgapped-controller-v3.1-40-1.tar.gz \
         --os-type=ubuntu24 --controller-size=S --keep-vm
-
-NOTE on --src-package: package_profile is built by conftest.py from
---src-package (falling back to --package-name). If left blank, the
-engine still runs off whatever src_version/src_package the fixture
-resolves internally -- this file's own detection of "installed version"
-is purely for the report, not for deciding what to upgrade from.
 
 Requires fixtures already defined in conftest.py:
     ssh_client          -- connects to --controller-ip when --skip-bringup
                            is set, bypassing Terraform provisioning entirely
     controller_profile   -- size/ha/os_type profile
-    package_profile      -- src package info (name/version/url/tar_path),
-                           built from --src-package (falls back to
-                           --package-name if that's unset)
+    package_profile      -- src package info (name/url/tar_path), built
+                           from --package-url (required, no fallback)
     controller_upgrade   -- session-scoped (NOT autouse -- see conftest.py's
                            comment on this fixture for why). Runs
                            engine.run() the first time anything requests
@@ -36,10 +36,10 @@ Requires fixtures already defined in conftest.py:
                            (dst) extract dir on success. Cached afterward
                            for the rest of the session.
 
-IMPORTANT — fixture timing / ordering: controller_upgrade is no longer
-autouse, so it does NOT fire before every other test in the session. It
-only runs the first time a test explicitly requests it as a parameter --
-which TestUpgradeExecution.test_upgrade_completes below does. Because
+IMPORTANT — fixture timing / ordering: controller_upgrade is not autouse,
+so it does NOT fire before every other test in the session. It only runs
+the first time a test explicitly requests it as a parameter -- which
+TestUpgradeExecution.test_upgrade_completes below does. Because
 test_console_login.py collects alphabetically before this file, the
 intended sequence is:
 
@@ -56,12 +56,43 @@ intended sequence is:
            TestPostUpgradeLogin      -- confirms the org/user created
                                         BEFORE the upgrade can still log
                                         in AFTER it
+
+IMPORTANT — this whole file is skipped when --dst-package-url isn't set
+(e.g. Fresh Install runs, which collect this file too since that mode
+targets the entire tests/ directory). See skip_if_no_upgrade_requested
+below.
 """
 
 import re
 import pytest
 
 pytestmark = [pytest.mark.order(2), pytest.mark.controller, pytest.mark.upgrade]
+
+
+@pytest.fixture(autouse=True)
+def skip_if_no_upgrade_requested(request):
+    """
+    Every test in this file exists to validate an upgrade. When
+    --dst-package-url isn't set (e.g. Fresh Install runs, which collect
+    this whole file too since that mode targets the entire tests/
+    directory, not just bringup-specific files), there is no upgrade to
+    validate -- the controller_upgrade fixture itself correctly no-ops in
+    that case, but individual test BODIES in this file would still run
+    and either pass trivially (nothing meaningful was checked) or -- worse
+    -- fail for reasons entirely unrelated to any upgrade (e.g.
+    TestPostUpgradeLogin failing because signup itself had an issue
+    earlier in the same run, which then shows up in the report looking
+    like an upgrade regression when no upgrade was ever attempted).
+
+    Skipping the whole file outright when there's nothing to validate is
+    clearer than letting it run in this degraded, potentially-misleading
+    pass-or-fail state.
+    """
+    if not request.config.getoption("--dst-package-url", default=None):
+        pytest.skip(
+            "--dst-package-url not set -- no upgrade was requested this run, "
+            "skipping upgrade validation (see this file's module docstring)"
+        )
 
 
 def _extract_version(pkg: str) -> str:
@@ -142,11 +173,11 @@ class TestUpgradeReportedState:
         attach_output(extras, "installed version (detected, post-hoc)", installed or "UNKNOWN")
 
         declared = getattr(package_profile, "version", "") or ""
-        attach_output(extras, "--src-package declared version", declared or "(not supplied)")
+        attach_output(extras, "--package-url declared version", declared or "(not supplied)")
 
         if declared and installed and declared not in installed and installed not in declared:
             print(
-                f"[test_record_pre_upgrade_context] NOTE: --src-package declared "
+                f"[test_record_pre_upgrade_context] NOTE: --package-url declared "
                 f"'{declared}' but detected extract dir suggests '{installed}' -- "
                 f"check Jenkins parameters if this looks wrong."
             )
@@ -217,11 +248,16 @@ class TestPostUpgradeHealth:
         installed = _extract_version(actual_extract_dir + ".tar.gz") or actual_extract_dir
         attach_output(extras, "post-upgrade installed version (from active extract dir)", installed or "UNKNOWN")
 
-        dst_package = request.config.getoption("--dst-package") or ""
-        dst_version = (
-            request.config.getoption("--dst-version") or _extract_version(dst_package)
-        )
-        attach_output(extras, "--dst-package declared version", dst_version or "UNKNOWN")
+        # UPDATED per team design review (2026-07-22): --dst-package /
+        # --dst-version no longer exist as CLI options -- --dst-package-url
+        # is the only thing conftest.py accepts now. Version here is
+        # derived best-effort from the URL purely for a readable report
+        # label; it's not used to gate anything, since there's no more
+        # per-version hop lookup that could be gotten wrong.
+        dst_package_url = request.config.getoption("--dst-package-url") or ""
+        dst_package_name = dst_package_url.rsplit("/", 1)[-1] if dst_package_url else ""
+        dst_version = _extract_version(dst_package_name)
+        attach_output(extras, "--dst-package-url declared version", dst_version or "UNKNOWN")
 
         assert actual_extract_dir, (
             "package_profile._actual_extract_dir was never set -- "
