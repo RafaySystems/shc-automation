@@ -375,27 +375,3 @@ class ConsoleLogin:
             dashboard["page_text_preview"] = ""
 
         return dashboard
-
-    def _detect_mfa_page(self, page) -> str:
-        has_canvas   = page.locator("canvas").count() > 0
-        has_img_qr   = page.locator("img[src*='qr'], img[alt*='QR' i]").count() > 0
-        has_verify   = page.locator("input[name='verify_token']").count() > 0
-        has_sixdigit = page.locator("input[placeholder='Enter 6-digit code']").count() > 0
-
-        # ← ADD THIS DEBUG
-        print(f"[console_login] MFA page debug:")
-        print(f"  has_canvas   : {has_canvas}")
-        print(f"  has_img_qr   : {has_img_qr}")
-        print(f"  has_verify   : {has_verify}")
-        print(f"  has_sixdigit : {has_sixdigit}")
-        # Save screenshot for inspection
-        page.screenshot(path="/tmp/mfa_page_debug.png")
-        print(f"  screenshot   : /tmp/mfa_page_debug.png")
-
-        if (has_canvas or has_img_qr) and has_verify:
-            return "enrollment"
-        if has_sixdigit:
-            return "otp"
-        if has_verify:
-            return "otp"
-        return "unknown"

@@ -37,18 +37,42 @@ pytestmark = [pytest.mark.order(2), pytest.mark.controller, pytest.mark.console]
 # ─────────────────────────────────────────────────────────────────────────────
 
 def attach_output(extras, label: str, content: str):
-    """Attach text block to pytest-html report."""
+    """
+    Attach text block to the report.
+
+    Same fix as attach_screenshot() above -- this only ever attached to
+    pytest_html's extras, never to Allure.
+    """
     try:
         import pytest_html
         block = f"<pre style='font-size:12px;white-space:pre-wrap'>{content}</pre>"
         item  = pytest_html.extras.html(f"<b>{label}</b>{block}")
         extras.append(item)
     except Exception as e:
-        print(f"[attach_output] failed: {e}")
+        print(f"[attach_output] pytest-html attach failed: {e}")
+
+    try:
+        import allure
+        allure.attach(content, name=label, attachment_type=allure.attachment_type.TEXT)
+    except Exception as e:
+        print(f"[attach_output] Allure attach failed: {e}")
 
 
 def attach_screenshot(extras, label: str, screenshot_bytes: bytes):
-    """Attach PNG screenshot to pytest-html report."""
+    """
+    Attach PNG screenshot to the report.
+
+    Previously only attached to pytest_html's extras -- never to Allure at
+    all. This is the same class of gap already found and fixed twice
+    elsewhere in this codebase (attach_output() in test_controller_upgrade.py
+    originally had the identical problem, just for text instead of images).
+    The screenshot bytes themselves were always being captured correctly by
+    ConsoleLogin.login() in lib/console/mfa_login.py -- even on failure,
+    since its except block screenshots the page BEFORE browser.close() runs
+    in finally -- they just never made it into the Allure report specifically,
+    which is why "Login failed" showed up with zero attached screenshot even
+    though a real one existed the whole time.
+    """
     try:
         import pytest_html
         import base64
@@ -59,9 +83,22 @@ def attach_screenshot(extras, label: str, screenshot_bytes: bytes):
             f"style='max-width:900px;border:1px solid #ccc;margin-top:6px'/>"
         )
         extras.append(item)
-        print(f"[attach_screenshot] ✓ attached '{label}' ({len(screenshot_bytes)} bytes)")
+        print(f"[attach_screenshot] ✓ attached '{label}' to pytest-html ({len(screenshot_bytes)} bytes)")
     except Exception as e:
-        print(f"[attach_screenshot] failed: {e}")
+        print(f"[attach_screenshot] pytest-html attach failed: {e}")
+
+    try:
+        import allure
+        allure.attach(
+            screenshot_bytes,
+            name=label,
+            attachment_type=allure.attachment_type.PNG,
+        )
+        print(f"[attach_screenshot] ✓ attached '{label}' to Allure ({len(screenshot_bytes)} bytes)")
+    except Exception as e:
+        # Allure not installed / not active in this run -- pytest-html
+        # attachment above still succeeded, so don't fail the test over this.
+        print(f"[attach_screenshot] Allure attach failed: {e}")
 
 
 def _save_secret_to_config(env: str, secret: str):
@@ -90,7 +127,6 @@ def _get_star_domain(request, controller_fqdn, raw_config) -> str:
     return f"shc-{build}.{base}" if base and build else ""
 
 
-time.sleep(3)
 def _browser_login_and_screenshot(url: str, email: str, password: str) -> tuple:
     """
     Login to a Rafay console URL via playwright browser.
