@@ -125,6 +125,62 @@ def attach_output(extras, label: str, content: str):
         pass
 
 
+def attach_pod_logs(ssh_client, extras, bad_lines, tail=200):
+    """
+    For every pod line that isn't Running/Completed, pull logs for each of
+    its containers (regular + init containers) and attach them to the
+    report -- so a Jenkins node SSH isn't needed to see why a pod is
+    unhealthy.
+
+    Same as test_controller_install.py's version -- duplicated here rather
+    than shared, since this file previously had NO log-attachment at all
+    for test_all_pods_running: it was a bare assert with just the pod
+    status line, no kubectl logs/describe for any of the unhealthy pods
+    (confirmed via a real Allure report showing 7 CrashLoopBackOff pods
+    with zero attached diagnostics). This mirrors exactly the same gap
+    already fixed once in test_controller_install.py, just never carried
+    over to this file.
+
+    For each container this attaches:
+      - current logs   (kubectl logs --tail=N)
+      - previous logs  (kubectl logs --previous --tail=N) -- usually where
+        the actual crash reason lives for a CrashLoopBackOff pod, since the
+        current instance may have just restarted seconds ago.
+    """
+    for pod_line in bad_lines:
+        parts = pod_line.split()
+        if len(parts) < 2:
+            continue
+        ns, pod_name = parts[0], parts[1]
+
+        containers_out, _ = ssh_client.run(
+            f"kubectl get pod {pod_name} -n {ns} "
+            f"-o jsonpath='{{.spec.containers[*].name}} {{.spec.initContainers[*].name}}' "
+            f"2>/dev/null"
+        )
+        containers = [c for c in containers_out.split() if c]
+        if not containers:
+            containers = [""]
+
+        for container in containers:
+            c_flag = f"-c {container}" if container else ""
+            label  = f"{ns}/{pod_name}" + (f" [{container}]" if container else "")
+
+            logs_out, _ = ssh_client.run(
+                f"kubectl logs {pod_name} -n {ns} {c_flag} --tail={tail} 2>&1"
+            )
+            attach_output(extras, f"logs: {label}", logs_out)
+
+            prev_out, prev_rc = ssh_client.run(
+                f"kubectl logs {pod_name} -n {ns} {c_flag} --previous --tail={tail} 2>&1"
+            )
+            if prev_rc == 0 and prev_out.strip():
+                attach_output(extras, f"logs (previous instance): {label}", prev_out)
+
+            print(f"[attach_pod_logs] {label}: attached current"
+                  f"{' + previous' if (prev_rc == 0 and prev_out.strip()) else ''} logs")
+
+
 def _detect_installed_version(ssh_client) -> str:
     """
     Best-effort detection of the currently-installed controller version by
@@ -221,6 +277,12 @@ class TestPostUpgradeHealth:
             l for l in out.splitlines()
             if any(s in l for s in ("Pending", "Error", "CrashLoop", "Init:", "OOMKilled"))
         ]
+        if bad:
+            # This is the fix -- previously nothing here ever attached logs
+            # for the unhealthy pods, so a report could show "7 unhealthy
+            # pod(s)" with zero information about WHY any of them were
+            # crashing, forcing an SSH to the node just to find out.
+            attach_pod_logs(ssh_client, extras, bad)
         assert not bad, f"{len(bad)} unhealthy pod(s) after upgrade:\n" + "\n".join(bad)
 
     def test_dst_version_installed(self, ssh_client, package_profile, request, extras):
