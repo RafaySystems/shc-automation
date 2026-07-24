@@ -69,6 +69,49 @@ class SSHClient:
             f"  3. Username is correct (ubuntu for Ubuntu, opc for Oracle Linux)"
         )
 
+    def _open_channel(self, transport, channel_timeout: int = 30,
+                       retries: int = 3, retry_interval: int = 10):
+        """
+        Opens a new SSH channel with an explicit timeout and retry.
+
+        NOTE: transport.open_session() with NO timeout argument (the
+        previous behavior here) has no default timeout in paramiko at all
+        -- if the SSH server doesn't respond promptly to a channel-open
+        request for any reason (server briefly under load right after
+        auth, a network hiccup, etc.), the call blocks INDEFINITELY, with
+        no way to time out or retry. This was the actual root cause of
+        builds appearing to hang for a long/unbounded time right after a
+        clean, fast connect() -- connect() has its own bounded retry loop,
+        but every .run()/.run_stream() call after it had zero protection
+        at all on the very next channel-open.
+
+        Passing timeout= here makes paramiko raise
+        paramiko.ssh_exception.SSHException("Timeout opening channel.")
+        after channel_timeout seconds instead of blocking forever, and the
+        retry loop gives a transient stall a few bounded chances to
+        recover before failing loudly. Worst case is now
+        retries * (channel_timeout + retry_interval) seconds, not
+        unbounded.
+        """
+        last_error = None
+        for attempt in range(1, retries + 1):
+            try:
+                return transport.open_session(timeout=channel_timeout)
+            except (paramiko.ssh_exception.SSHException, EOFError, socket.timeout) as e:
+                last_error = e
+                print(f"[SSHClient] open_session attempt {attempt}/{retries} "
+                      f"failed/timed out on {self.host} ({e})")
+                if attempt < retries:
+                    print(f"[SSHClient] Retrying channel open in {retry_interval}s ...")
+                    time.sleep(retry_interval)
+
+        raise RuntimeError(
+            f"Could not open SSH channel on {self.host} after {retries} attempts.\n"
+            f"Last error: {last_error}\n"
+            f"Connection itself was fine (connect() succeeded) -- this is the "
+            f"server failing to respond to a channel-open request specifically."
+        )
+
     def run(self, command: str, timeout: int = 120):
         """
         Run a command and return (stdout_str, exit_code).
@@ -85,7 +128,7 @@ class SSHClient:
         if not transport or not transport.is_active():
             raise RuntimeError(f"SSH transport not active for {self.host}")
 
-        channel = transport.open_session()
+        channel = self._open_channel(transport)
         channel.set_combine_stderr(True)
         channel.exec_command(command)
 
@@ -154,7 +197,7 @@ class SSHClient:
         if not transport or not transport.is_active():
             raise RuntimeError(f"SSH transport not active for {self.host}")
 
-        channel = transport.open_session()
+        channel = self._open_channel(transport)
         channel.set_combine_stderr(True)
         channel.exec_command(command)
 
