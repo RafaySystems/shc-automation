@@ -760,40 +760,8 @@ class TestPackageSetup:
 class TestRadmInstall:
     """Drive the radm installation steps sequentially."""
 
-    # Class-level cache for the "cluster already fully applied" check.
-    # Computed once (by whichever of dependency/application/cluster runs
-    # first), then reused by the other two so we don't repeat the same
-    # kubectl query three times in a row.
-    _cluster_healthy = None
-
-    def _check_cluster_already_healthy(self, ssh_client, extras):
-        """
-        Check once whether ALL pods are already Running/Completed -- no
-        exceptions. If any pod, for any reason, is not Running/Completed,
-        the cluster is treated as not-yet-healthy and the caller will
-        re-run its radm step. There is no exclusion list here: a pod that
-        can't come up is a real failure and should be surfaced as one,
-        not quietly waved through.
-
-        Result is cached on the class so this kubectl query only runs once
-        per test session, not once per test.
-        """
-        if TestRadmInstall._cluster_healthy is not None:
-            return TestRadmInstall._cluster_healthy
-
-        pods_out, pods_rc = ssh_client.run("kubectl get pods -A --no-headers 2>/dev/null")
-        lines     = [l for l in pods_out.splitlines() if l.strip()]
-        not_ready = [l for l in lines if "Running" not in l and "Completed" not in l]
-        healthy   = pods_rc == 0 and bool(lines) and not not_ready
-
-        attach_output(extras, "pre-check pod status",
-                      "total=" + str(len(lines)) + " not_ready=" + str(len(not_ready)))
-
-        TestRadmInstall._cluster_healthy = healthy
-        return healthy
-
     def _wait_for_pods(self, ssh_client, extras, label="pods", max_wait=1500,
-                       fail_on_timeout=False, quick_check=False):
+                       fail_on_timeout=False):
         """
         Poll kubectl get pods -A every 30s.
         Waits until two consecutive checks show ALL pods Running/Completed
@@ -805,36 +773,14 @@ class TestRadmInstall:
             label          : label for log/report output e.g. "after radm init"
             max_wait       : seconds to wait (default 25 min)
             fail_on_timeout: ignored - always continues after timeout with describe output
-            quick_check    : if True, skip the poll loop entirely and do ONE
-                             kubectl get pods call instead. Use this when
-                             _check_cluster_already_healthy() already
-                             confirmed the cluster is healthy just before
-                             calling this -- there is nothing to wait for,
-                             since radm dependency/application/cluster were
-                             never re-run in that branch. Waiting the full
-                             max_wait here (as every call site used to) just
-                             burns 20-40 minutes per test re-confirming
-                             something already confirmed a moment ago.
+
+        NOTE: only called when this test class is actually driving the
+        install (--skip-bringup) -- see the guard at the top of each
+        test_radm_*_completes method. In the normal path, controller_bringup/
+        controller_upgrade fixtures already ran + verified pod health before
+        any test here executes, so this class no longer re-polls in that case.
         """
         import time
-
-        if quick_check:
-            print("[" + label + "] quick_check=True (cluster already confirmed healthy) "
-                  "- single kubectl check, no poll loop ...")
-            pods_out, pods_rc = ssh_client.run(
-                "kubectl get pods -A --no-headers 2>/dev/null || "
-                "/usr/local/bin/kubectl get pods -A --no-headers 2>&1"
-            )
-            lines = [l for l in pods_out.splitlines() if l.strip()]
-            not_ready = [l for l in lines if "Running" not in l and "Completed" not in l]
-            attach_output(extras, "quick check (" + label + ")", pods_out)
-            print("[" + label + "] quick check: " + str(len(lines)) + " pods, " +
-                  str(len(not_ready)) + " not ready")
-            if not_ready:
-                print("[" + label + "] quick check found unexpected not-ready pods "
-                      "despite already-healthy guard - attaching logs ...")
-                attach_pod_logs(ssh_client, extras, not_ready)
-            return
 
         poll_every   = 30
         deadline     = time.time() + max_wait
@@ -942,7 +888,10 @@ class TestRadmInstall:
         assert out.strip() != "", "star-domain is missing from config.yaml"
 
     def test_radm_init_completes(self, ssh_client, package_profile,
-                                  controller_profile, secondary_ips, extras):
+                                  controller_profile, secondary_ips, extras, request):
+        if not request.config.getoption("--skip-bringup"):
+            pytest.skip("controller_bringup fixture already ran + verified radm init")
+
         from lib.ssh.ssh_client import SSHClient
 
         extract_dir = getattr(package_profile, "_actual_extract_dir", None)
@@ -1121,88 +1070,66 @@ class TestRadmInstall:
             attach_output(extras, "kubectl get nodes (after join)", nodes_out)
             print("[test_radm_init_completes] All nodes:\n" + nodes_out)
 
-        # already_initialized => radm init was skipped above (kubeconfig
-        # already existed, e.g. right after an upgrade) -- nothing was
-        # actually re-run, so there's nothing new to wait for beyond a
-        # single confirmation snapshot. Same fix as dependency/application/
-        # cluster: only fall back to the full poll loop when radm init
-        # genuinely just ran.
-        self._wait_for_pods(ssh_client, extras, label="after radm init",
-                            quick_check=already_initialized)
+        self._wait_for_pods(ssh_client, extras, label="after radm init")
 
-    def test_radm_dependency_completes(self, ssh_client, package_profile, controller_profile, extras):
+    def test_radm_dependency_completes(self, ssh_client, package_profile, controller_profile, extras, request):
+        if not request.config.getoption("--skip-bringup"):
+            pytest.skip("controller_bringup fixture already ran + verified radm dependency")
+
         extract_dir = (
             getattr(package_profile, '_actual_extract_dir', None)
             or '/opt/rafay/rafay-airgapped-controller-v3.1-39'
         )
 
-        already_healthy = self._check_cluster_already_healthy(ssh_client, extras)
-        if already_healthy:
-            print("[test_radm_dependency_completes] Cluster already healthy "
-                  "(all pods Running/Completed) - skipping radm dependency re-run")
-            attach_output(extras, "radm dependency status", "Already applied - skipped re-run")
-        else:
-            out, rc = ssh_client.run(
-                "cd " + extract_dir + " && sudo ./radm dependency --config config.yaml 2>&1",
-                timeout=600,
-            )
-            attach_output(extras, "radm dependency output", out)
-            assert rc == 0, "radm dependency failed (exit " + str(rc) + "). See output above."
-            print("[test_radm_dependency_completes] radm dependency passed")
+        out, rc = ssh_client.run(
+            "cd " + extract_dir + " && sudo ./radm dependency --config config.yaml 2>&1",
+            timeout=600,
+        )
+        attach_output(extras, "radm dependency output", out)
+        assert rc == 0, "radm dependency failed (exit " + str(rc) + "). See output above."
+        print("[test_radm_dependency_completes] radm dependency passed")
 
-        # already_healthy => nothing was re-run above, so there is nothing
-        # to wait for beyond a single confirmation snapshot -- only fall
-        # back to the full poll loop when radm dependency actually ran.
-        self._wait_for_pods(ssh_client, extras, label="after radm dependency",
-                            quick_check=already_healthy)
+        self._wait_for_pods(ssh_client, extras, label="after radm dependency")
 
-    def test_radm_application_completes(self, ssh_client, package_profile, extras):
+    def test_radm_application_completes(self, ssh_client, package_profile, extras, request):
+        if not request.config.getoption("--skip-bringup"):
+            pytest.skip("controller_bringup fixture already ran + verified radm application")
+
         extract_dir = (
             getattr(package_profile, '_actual_extract_dir', None)
             or '/opt/rafay/rafay-airgapped-controller-v3.1-39'
         )
 
-        already_healthy = self._check_cluster_already_healthy(ssh_client, extras)
-        if already_healthy:
-            print("[test_radm_application_completes] Cluster already healthy "
-                  "(all pods Running/Completed) - skipping radm application re-run")
-            attach_output(extras, "radm application status", "Already applied - skipped re-run")
-        else:
-            out, rc = ssh_client.run(
-                "cd " + extract_dir + " && sudo ./radm application --config config.yaml 2>&1",
-                timeout=2400,
-            )
-            attach_output(extras, "radm application output", out)
-            assert rc == 0, "radm application failed (exit " + str(rc) + "). See output above."
-            print("[test_radm_application_completes] radm application passed")
+        out, rc = ssh_client.run(
+            "cd " + extract_dir + " && sudo ./radm application --config config.yaml 2>&1",
+            timeout=2400,
+        )
+        attach_output(extras, "radm application output", out)
+        assert rc == 0, "radm application failed (exit " + str(rc) + "). See output above."
+        print("[test_radm_application_completes] radm application passed")
 
         self._wait_for_pods(ssh_client, extras, label="after radm application",
-                            max_wait=2400, fail_on_timeout=True,
-                            quick_check=already_healthy)
+                            max_wait=2400, fail_on_timeout=True)
 
-    def test_radm_cluster_completes(self, ssh_client, package_profile, extras):
+    def test_radm_cluster_completes(self, ssh_client, package_profile, extras, request):
+        if not request.config.getoption("--skip-bringup"):
+            pytest.skip("controller_bringup fixture already ran + verified radm cluster")
+
         extract_dir = (
             getattr(package_profile, '_actual_extract_dir', None)
             or '/opt/rafay/rafay-airgapped-controller-v3.1-39'
         )
 
-        already_healthy = self._check_cluster_already_healthy(ssh_client, extras)
-        if already_healthy:
-            print("[test_radm_cluster_completes] Cluster already healthy "
-                  "(all pods Running/Completed) - skipping radm cluster re-run")
-            attach_output(extras, "radm cluster status", "Already applied - skipped re-run")
-        else:
-            out, rc = ssh_client.run(
-                "cd " + extract_dir + " && sudo ./radm cluster --config config.yaml 2>&1",
-                timeout=1200,
-            )
-            attach_output(extras, "radm cluster output", out)
-            assert rc == 0, "radm cluster failed (exit " + str(rc) + "). See output above."
-            print("[test_radm_cluster_completes] radm cluster passed")
+        out, rc = ssh_client.run(
+            "cd " + extract_dir + " && sudo ./radm cluster --config config.yaml 2>&1",
+            timeout=1200,
+        )
+        attach_output(extras, "radm cluster output", out)
+        assert rc == 0, "radm cluster failed (exit " + str(rc) + "). See output above."
+        print("[test_radm_cluster_completes] radm cluster passed")
 
         self._wait_for_pods(ssh_client, extras, label="after radm cluster",
-                            max_wait=1200, fail_on_timeout=True,
-                            quick_check=already_healthy)
+                            max_wait=1200, fail_on_timeout=True)
 
 
 class TestPostInstallHealth:
