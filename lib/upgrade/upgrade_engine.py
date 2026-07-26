@@ -40,7 +40,7 @@ import time
 # ── Wait policies ─────────────────────────────────────────────────────────────
 PHASE_WAIT = {
     "radm_dependency":  {"interval": 20, "max_wait": 600},
-    "radm_application": {"interval": 20, "max_wait": 800},
+    "radm_application": {"interval": 20, "max_wait": 1000},
     "radm_cluster":     {"interval": 20, "max_wait": 800},
     "elasticsearch":    {"interval": 30, "max_wait": 600},
 }
