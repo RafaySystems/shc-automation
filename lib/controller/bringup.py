@@ -506,7 +506,7 @@ class ControllerBringup:
         assert krc == 0, "kubeconfig setup failed"
 
         if self.profile.ha and self.secondary_ips:
-            self._ha_join()
+            self._ha_join(out)
 
         expected = 3 if (self.profile.ha and self.secondary_ips) else 1
         print(f"[radm_init] Polling {expected} node(s) Ready every 30s for 5 min ...")
@@ -516,38 +516,55 @@ class ControllerBringup:
             expected_count=expected,
         )
 
-    def _ha_join(self):
-        """Build join command and run radm join on secondary nodes."""
-        kubeadm_out, _ = self.ssh.run(
-            "find /tmp/rafay-infra /usr/local/bin /usr/bin -name 'rafay-kubeadm' -type f 2>/dev/null | head -1"
+    @staticmethod
+    def _parse_ha_join_from_output(output: str):
+        """
+        Extract (primary_ip, token, ca_hash, cert_key) from radm init's own
+        printed control-plane join block, e.g.:
+
+            radm join 10.0.0.240:6443 --token 6dcqo9.7ree7r8kxb0cfq39 \\
+                --discovery-token-ca-cert-hash sha256:2602d27f... \\
+                --control-plane --certificate-key dd4cfc16... --config config.yaml
+
+        radm init also prints a second, worker-node join block further down
+        that lacks --control-plane/--certificate-key. Requiring
+        --control-plane immediately after the hash ensures we always match
+        the control-plane block, never the worker one.
+        """
+        import re
+        # Collapse "\" + newline shell continuations so line-wrapping
+        # differences between radm/package versions don't break the match.
+        flat = re.sub(r"\\\s*\n\s*", " ", output)
+
+        m = re.search(
+            r"radm join (\S+):6443\s+"
+            r"--token (\S+)\s+"
+            r"--discovery-token-ca-cert-hash sha256:(\S+)\s+"
+            r"--control-plane\s+--certificate-key (\S+)",
+            flat,
         )
-        kubeadm_bin = kubeadm_out.strip() or "/tmp/rafay-infra/packages/kubeadm/amd64/rafay-kubeadm"
+        assert m, "Could not find control-plane join command in radm init output"
 
-        token_out, _ = self.ssh.run(
-            f"sudo {kubeadm_bin} token list --kubeconfig=/etc/kubernetes/admin.conf 2>/dev/null | "
-            f"grep 'authentication,signing' | head -1 | awk '{{print $1}}'"
-        )
-        if not token_out.strip():
-            token_out, _ = self.ssh.run(f"sudo {kubeadm_bin} token create --kubeconfig=/etc/kubernetes/admin.conf 2>/dev/null")
+        pri_ip, token, ca_hash, cert_key = m.groups()
+        print(f"[ha_join] pri_ip   : {pri_ip}")
+        print(f"[ha_join] token    : {token}")
+        print(f"[ha_join] ca_hash  : {ca_hash}")
+        print(f"[ha_join] cert_key : {cert_key}")
+        return pri_ip, token, ca_hash, cert_key
 
-        ca_hash_out, _ = self.ssh.run(
-            "openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | "
-            "openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'"
-        )
-        primary_ip_out, _ = self.ssh.run("hostname -I | awk '{print $1}'")
-        cert_key_raw, _   = self.ssh.run(f"cd {self.extract_dir} && sudo ./radm init phase infra upload-certs --config config.yaml 2>&1")
+    def _ha_join(self, radm_init_output: str):
+        """
+        Build join command and run radm join on secondary nodes.
 
-        cert_key = ""
-        for line in cert_key_raw.splitlines():
-            stripped = line.strip()
-            if len(stripped) == 64 and all(c in "0123456789abcdef" for c in stripped):
-                cert_key = stripped
-                break
-
-        token  = token_out.strip()
-        ca_hash = ca_hash_out.strip()
-        pri_ip  = primary_ip_out.strip()
-        assert token and ca_hash and pri_ip and cert_key, "Could not build join command — missing token/hash/cert_key"
+        token / ca_hash / pri_ip / cert_key are parsed directly out of radm
+        init's own printed control-plane join command — NOT re-derived via
+        kubeadm/openssl/`radm init phase infra upload-certs`. That subcommand
+        isn't guaranteed to exist across package versions (confirmed missing
+        entirely on v3.1.x-master-1-35 — build #31 RCA) and re-deriving
+        values radm init already handed us was unnecessary scope creep.
+        radm init is the single source of truth for these values.
+        """
+        pri_ip, token, ca_hash, cert_key = self._parse_ha_join_from_output(radm_init_output)
 
         join_cmd = (
             f"cd {self.extract_dir} && sudo ./radm join {pri_ip}:6443 "
