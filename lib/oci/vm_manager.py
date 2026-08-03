@@ -105,6 +105,20 @@ def load_oci_profile(cfg: dict, build_no: Optional[str] = None) -> OCIProfile:
         or oci_cfg["ssh_public_key"]
     )
 
+    # NOTE: unlike every other field above, `ha` used to read straight
+    # from dev.yaml ("controller.ha") and ignore CONTROLLER_HA entirely.
+    # That let this OCIProfile disagree with config_loader.py's
+    # ControllerProfile (which DOES honor CONTROLLER_HA) -- e.g. Jenkins
+    # correctly resolving CONTROLLER_HA=false for a POC run, pytest
+    # validation passing on that basis, but Terraform still getting
+    # ha=true from dev.yaml and provisioning 3 nodes anyway. Mirrors
+    # config_loader.py's resolved_ha logic so both profiles always agree.
+    env_ha = os.environ.get("CONTROLLER_HA")
+    if env_ha is not None:
+        resolved_ha = env_ha.lower() in ("true", "1", "yes")
+    else:
+        resolved_ha = bool(cfg.get("controller", {}).get("ha", False))
+
     return OCIProfile(
         config_file=resolve(oci_cfg.get("config_file", "~/.oci/config"), "OCI_CONFIG_FILE"),
         profile=resolve(oci_cfg.get("profile", "DEFAULT"), "OCI_PROFILE"),
@@ -121,7 +135,7 @@ def load_oci_profile(cfg: dict, build_no: Optional[str] = None) -> OCIProfile:
         data_volume_gb=int(resolve(oci_cfg.get("data_volume_gb", 1024), "OCI_DATA_VOLUME_GB")),
         ssh_public_key=resolved_ssh_public_key,
         display_name=resolve(oci_cfg.get("display_name", "rafay-controller"), "OCI_DISPLAY_NAME"),
-        ha=bool(cfg.get("controller", {}).get("ha", False)),
+        ha=resolved_ha,
         tags=oci_cfg.get("tags") or {},
         boot_timeout=int(resolve(oci_cfg.get("boot_timeout", 300), "OCI_BOOT_TIMEOUT")),
     )
