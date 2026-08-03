@@ -66,13 +66,13 @@ class ControllerProfile:
     def cpu(self) -> int:
         # POC value is a PLACEHOLDER (4 CPU) -- not yet confirmed with the
         # team. Update once the real POC spec is known.
-        return {"S": 16, "M": 24, "L": 48, "POC": 4}[self.controller_size]
+        return {"S": 16, "M": 24, "L": 48, "POC": 16}[self.controller_size]
 
     @property
     def memory_gb(self) -> int:
         # POC value is a PLACEHOLDER (16GB) -- not yet confirmed with the
         # team. Update once the real POC spec is known.
-        return {"S": 64, "M": 64, "L": 192, "POC": 16}[self.controller_size]
+        return {"S": 64, "M": 64, "L": 192, "POC": 64}[self.controller_size]
 
     def summary(self) -> str:
         return (
