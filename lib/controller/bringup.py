@@ -139,7 +139,13 @@ class ControllerBringup:
         self._phase("radm_dependency",      self._radm_dependency)
         self._phase("radm_application",     self._radm_application)
         self._phase("patch_hosts",          self._patch_hosts)
+        self._capture_containerd_config("before radm_cluster")
+        self._snapshot_health("before radm_cluster")
+        self._start_iostat_capture("radm_cluster")
         self._phase("radm_cluster",         self._radm_cluster)
+        self._stop_iostat_capture("radm_cluster")
+        self._snapshot_health("after radm_cluster")
+        self._deep_diagnostics("after radm_cluster")
 
         print("\n" + "═" * 60)
         print(f"[bringup] ✅ Controller bringup complete")
@@ -147,6 +153,70 @@ class ControllerBringup:
         print("═" * 60 + "\n")
 
     # ── Phase runner ──────────────────────────────────────────────────────────
+
+    def _deep_diagnostics(self, label: str):
+        """
+        Extended diagnostics beyond _snapshot_health/iostat -- run once,
+        right after radm_cluster, since these are heavier/more specific:
+          1. PSI (Pressure Stall Information) -- quantified stall %, the
+             modern replacement for eyeballing dmesg hung-task lines.
+          2. Per-container I/O attribution -- which container is actually
+             driving disk load, not just "disk is busy."
+          3. Kubelet's own node conditions/events -- DiskPressure/
+             MemoryPressure taints, straight from kubelet itself.
+          4. CPU steal time -- rules out noisy-neighbor contention on the
+             shared OCI host, distinct from our own OCPU count.
+        Read-only, never raises.
+        """
+        print(f"\n[health][{label}] ══ deep diagnostics ═══════════════")
+
+        try:
+            out, _ = self.ssh.run(
+                "echo '--- /proc/pressure/io ---' && cat /proc/pressure/io 2>/dev/null && "
+                "echo '--- /proc/pressure/memory ---' && cat /proc/pressure/memory 2>/dev/null && "
+                "echo '--- /proc/pressure/cpu ---' && cat /proc/pressure/cpu 2>/dev/null",
+                timeout=15,
+            )
+            print(f"[health][{label}] PSI:\n{out}")
+        except Exception as e:
+            print(f"[health][{label}] PSI capture failed (non-fatal): {e}")
+
+        try:
+            out, _ = self.ssh.run(
+                "(which pidstat >/dev/null 2>&1 || sudo apt-get install -y sysstat >/dev/null 2>&1 || true) && "
+                "pidstat -d 1 3 2>/dev/null | tail -40",
+                timeout=20,
+            )
+            print(f"[health][{label}] per-process disk I/O (pidstat):\n{out}")
+        except Exception as e:
+            print(f"[health][{label}] pidstat capture failed (non-fatal): {e}")
+
+        try:
+            out, _ = self.ssh.run(
+                "sudo crictl stats --output json 2>/dev/null | head -150 || echo 'crictl unavailable'",
+                timeout=20,
+            )
+            print(f"[health][{label}] per-container stats (crictl):\n{out}")
+        except Exception as e:
+            print(f"[health][{label}] crictl stats failed (non-fatal): {e}")
+
+        try:
+            out, _ = self.ssh.run(
+                "echo '--- node conditions ---' && kubectl describe node 2>/dev/null | grep -A10 Conditions && "
+                "echo '--- recent events ---' && kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -40",
+                timeout=20,
+            )
+            print(f"[health][{label}] kubelet conditions/events:\n{out}")
+        except Exception as e:
+            print(f"[health][{label}] kubelet conditions capture failed (non-fatal): {e}")
+
+        try:
+            out, _ = self.ssh.run("top -bn1 | head -5", timeout=15)
+            print(f"[health][{label}] CPU (check %st steal):\n{out}")
+        except Exception as e:
+            print(f"[health][{label}] CPU steal capture failed (non-fatal): {e}")
+
+        print(f"[health][{label}] ══ end deep diagnostics ═══════════════\n")
 
     def _phase(self, name: str, fn):
         """Run a phase, print header/footer, raise BringupError on failure."""
@@ -158,6 +228,75 @@ class ControllerBringup:
             raise
         except Exception as e:
             raise BringupError(name, str(e)) from e
+
+    # ── Diagnostics ───────────────────────────────────────────────────────────
+
+    def _snapshot_health(self, label: str):
+        """
+        Capture live health telemetry into the Jenkins log so a stall/hang
+        is diagnosable from the build output alone -- no serial console
+        race required afterward. Cheap, read-only, never raises.
+        """
+        print(f"\n[health][{label}] ── snapshot ─────────────────────────")
+        try:
+            out, _ = self.ssh.run(
+                "echo '--- uptime ---' && uptime && "
+                "echo '--- free -h ---' && free -h && "
+                "echo '--- df -h ---' && df -h / && "
+                "echo '--- hung tasks / jbd2 (dmesg) ---' && "
+                "(sudo dmesg 2>/dev/null | grep -iE 'blocked for more than|jbd2' | tail -20 || echo 'none') && "
+                "echo '--- top 5 by CPU ---' && ps -eo pid,pcpu,pmem,comm --sort=-pcpu | head -6",
+                timeout=30,
+            )
+            print(out)
+        except Exception as e:
+            print(f"[health][{label}] snapshot failed (non-fatal): {e}")
+        print(f"[health][{label}] ── end snapshot ─────────────────────\n")
+
+    def _capture_containerd_config(self, label: str):
+        """Record containerd's actual running config for later diffing."""
+        try:
+            out, _ = self.ssh.run(
+                "echo '--- containerd config.toml (root/snapshotter) ---' && "
+                "sudo cat /etc/containerd/config.toml 2>/dev/null | grep -iE 'snapshotter|root =' && "
+                "echo '--- containerd version ---' && containerd --version 2>/dev/null",
+                timeout=15,
+            )
+            print(f"[health][{label}] containerd config:\n{out}")
+        except Exception as e:
+            print(f"[health][{label}] containerd config capture failed (non-fatal): {e}")
+
+    def _start_iostat_capture(self, tag: str = "cluster") -> str:
+        """
+        Launch iostat in the background for the duration of a phase.
+        Returns the PID-file path so the caller can stop it later.
+        Cheap and non-blocking; never raises.
+        """
+        pidfile = f"/tmp/iostat_{tag}.pid"
+        logfile = f"/tmp/iostat_{tag}.log"
+        try:
+            self.ssh.run(
+                f"(which iostat >/dev/null 2>&1 || sudo apt-get install -y sysstat >/dev/null 2>&1 || true) && "
+                f"nohup iostat -x -d -t 5 > {logfile} 2>&1 & echo $! > {pidfile}",
+                timeout=20,
+            )
+            print(f"[health] iostat capture started (tag={tag})")
+        except Exception as e:
+            print(f"[health] iostat start failed (non-fatal): {e}")
+        return pidfile
+
+    def _stop_iostat_capture(self, tag: str = "cluster"):
+        """Stop the background iostat and print whatever it captured."""
+        pidfile = f"/tmp/iostat_{tag}.pid"
+        logfile = f"/tmp/iostat_{tag}.log"
+        try:
+            self.ssh.run(f"kill $(cat {pidfile} 2>/dev/null) 2>/dev/null || true", timeout=10)
+            out, _ = self.ssh.run(f"cat {logfile} 2>/dev/null | tail -200", timeout=15)
+            print(f"\n[health] ── iostat during {tag} ─────────────────────")
+            print(out or "(no iostat output captured)")
+            print(f"[health] ── end iostat ─────────────────────\n")
+        except Exception as e:
+            print(f"[health] iostat stop/read failed (non-fatal): {e}")
 
     # ── Phase implementations ─────────────────────────────────────────────────
 
