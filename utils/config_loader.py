@@ -51,7 +51,7 @@ class ControllerProfile:
             mode = "HA" if self.ha else "Non-HA"
             raise ValueError(
                 f"Size '{self.controller_size}' does not support {mode} mode. "
-                f"Size S = Non-HA only | Size M = both | Size L = HA only."
+                f"S/M/L = HA only | POC = Non-HA only."
             )
         # Expand ~ and any ${ENV_VAR} references in key paths
         self.ssh_key = str(Path(os.path.expandvars(self.ssh_key)).expanduser())
