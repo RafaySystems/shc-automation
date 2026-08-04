@@ -16,12 +16,13 @@ from typing import Optional
 
 @dataclass
 class LoginResult:
-    success:    bool
-    url:        str
-    secret:     str
-    screenshot: bytes
-    dashboard:  dict = field(default_factory=dict)
-    error:      str = ""
+    success:      bool
+    url:          str
+    secret:       str
+    screenshot:   bytes
+    dashboard:    dict = field(default_factory=dict)
+    error:        str = ""
+    qr_screenshot: bytes = b""
 
 
 class ConsoleLogin:
@@ -37,6 +38,7 @@ class ConsoleLogin:
         self.email      = email
         self.password   = password
         self.mfa_secret = mfa_secret
+        self._qr_bytes  = b""
 
     def login(self) -> LoginResult:
         try:
@@ -68,6 +70,7 @@ class ConsoleLogin:
                     secret=secret,
                     screenshot=screenshot,
                     dashboard=dashboard,
+                    qr_screenshot=self._qr_bytes,
                 )
             except Exception as e:
                 screenshot = page.screenshot(full_page=False)
@@ -77,6 +80,7 @@ class ConsoleLogin:
                     secret=self.mfa_secret or "",
                     screenshot=screenshot,
                     error=str(e),
+                    qr_screenshot=self._qr_bytes,
                 )
             finally:
                 browser.close()
@@ -306,7 +310,12 @@ class ConsoleLogin:
         if not b64_data:
             raise ValueError("Canvas found but toDataURL returned nothing")
 
-        image   = Image.open(io.BytesIO(base64.b64decode(b64_data)))
+        # Save the raw QR image itself (the canvas IS the QR code — no need
+        # for a broader page screenshot) so it can be attached to the report
+        # regardless of whether decoding/login succeeds afterward.
+        self._qr_bytes = base64.b64decode(b64_data)
+
+        image   = Image.open(io.BytesIO(self._qr_bytes))
         decoded = decode(image)
 
         if not decoded:

@@ -193,7 +193,8 @@ def _browser_login_and_screenshot(url: str, email: str, password: str) -> tuple:
 
 
 def _get_authenticated_session(ops_url: str, email: str,
-                                password: str, mfa_secret: str) -> tuple:
+                                password: str, mfa_secret: str,
+                                extras: list = None) -> tuple:
     """
     Login to ops-console via playwright to get csrftoken + authenticated cookies.
     Returns: (csrftoken, requests.Session)
@@ -205,6 +206,13 @@ def _get_authenticated_session(ops_url: str, email: str,
     console = ConsoleLogin(url=ops_url, email=email,
                            password=password, mfa_secret=mfa_secret or None)
     result  = console.login()
+
+    if extras is not None:
+        if getattr(result, "qr_screenshot", b""):
+            attach_screenshot(extras, "TOTP enrollment QR code (admin session)", result.qr_screenshot)
+        if getattr(result, "secret", ""):
+            attach_output(extras, "TOTP secret (admin session)", result.secret)
+
     if not result.success:
         raise RuntimeError(f"Admin login failed: {result.error}")
 
@@ -333,6 +341,12 @@ class TestConsoleLogin:
         if result.screenshot:
             attach_screenshot(extras, "ops-console dashboard screenshot", result.screenshot)
 
+        if getattr(result, "qr_screenshot", b""):
+            attach_screenshot(extras, "TOTP enrollment QR code", result.qr_screenshot)
+
+        if getattr(result, "secret", ""):
+            attach_output(extras, "TOTP secret", result.secret)
+
         if result.success and result.secret and result.secret != mfa_secret:
             _save_secret_to_config(
                 request.config.getoption("--env", default="dev"),
@@ -420,7 +434,7 @@ class TestOrgAndUser:
                           or console_cfg.get("mfa_secret") or ""
 
         csrftoken, session = _get_authenticated_session(
-            ops_url, admin_email, admin_password, admin_secret
+            ops_url, admin_email, admin_password, admin_secret, extras=extras
         )
         attach_output(extras, "CSRF token", csrftoken[:15] + "..." if csrftoken else "EMPTY")
 
