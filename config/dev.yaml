@@ -12,10 +12,10 @@ console:
 controller:
   controller_size: S
   ha: true
-  ip: 
+  ip: 129.153.120.157
   ssh_key: "${RAUTO_OCI_SSH_KEY}"
   os_type: ubuntu24
-  provision: true
+  provision: false
   secondary_ips: []
   ssh_key: /Users/vijay/Documents/rafay-pytest-framework/keys/oci.key
   user: ubuntu
@@ -36,7 +36,7 @@ oci:
   config_file: ~/.oci/config
   data_volume_gb: 1024
   display_name: shc-{build_no}
-  image_id: ocid1.image.oc1.phx.aaaaaaaawcv7nuujttlzc3rdgw4svfbnbqlyh7cp5tje27wcseaipgdqm3eq
+  image_id: ocid1.image.oc1.phx.aaaaaaaazka6tmhtuwnupdcfs5lebvnnym3yyhlsgl33gnkj6fv2iwffsdna
   nsg_id: ocid1.networksecuritygroup.oc1.phx.aaaaaaaaadw43qbzlrucw7ulmspk5obfhugfnrckxoob4nlsinr3cuupne5q
   profile: DEFAULT
   shape: VM.Standard.E5.Flex
@@ -50,6 +50,6 @@ oci:
 package:
   install_dir: /opt/rafay
   name: rafay-airgapped-controller-v3.1-40.tar.gz
-  url: ''
+  url: 'https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/4.2/rafay-airgapped-controller-4.2-3.tar.gz'
 reporting:
   output_dir: reports
