@@ -1,0 +1,88 @@
+# config/hops/3.1-39__to__3.1-40-2.txt
+#
+# Canned patch commands for the 3.1-39 -> 3.1-40-2 upgrade.
+#
+# Sections map 1:1 to UpgradeEngine's hook stages, in the exact order
+# they run:
+#
+#   [pre_commands]           before download/radm phases run at all
+#   [new config.yaml created from old config.yaml + archive-directory patch]
+#   [config_patches]         version-specific field edits against the
+#                            NEW config.yaml, right after it's created
+#   [radm dependency runs -- NEW package only]
+#   [after_radm_dependency]  right after radm dependency completes
+#   [radm application runs -- NEW package only]
+#   [after_radm_application] right after radm application completes
+#   [post_commands]          right before radm cluster runs
+#   [radm cluster runs -- NEW package only]
+#   [after_radm_cluster]     right after radm cluster completes,
+#                            before final pod-health polling
+#
+# A section can be left empty (or omitted entirely) if that stage needs
+# nothing for this pair -- it just means no commands run at that point.
+#
+# Command rules:
+#   - End a line with `|| true` if it's allowed to fail without
+#     stopping the upgrade.
+#   - Leave `|| true` off if you want the upgrade to STOP on failure.
+#   - Plain kubectl / bash -- exactly what you'd run manually, one
+#     command per line.
+#   - Lines starting with # are comments; blank lines are ignored --
+#     use both freely to keep this readable.
+#
+# NOTE: every radm command (dependency, application, cluster) runs
+# exactly once, against the NEW package only -- there is no separate
+# "old package" radm cluster pass.
+
+[pre_commands]
+
+# Cleanup tmp
+sudo rm -rf /tmp/radm.log /tmp/rafay-dep* /tmp/rafay-cluster* /tmp/rafay-core* /tmp/istio-* 2>/dev/null || true
+
+# Install pigz for faster extraction
+sudo apt-get -o Acquire::ForceIPv4=true install -y pigz 2>&1 || true
+
+# Remove default storageclass
+kubectl patch storageclass openebs-hostpath --type=json -p='[{"op":"remove","path":"/metadata/annotations/storageclass.kubernetes.io~1is-default-class"}]' 2>/dev/null || true
+
+# Patch istio CRDs
+for crd in $(kubectl get crd -o name | grep -E '\.istio\.io$'); do kubectl annotate "$crd" meta.helm.sh/release-name=istio-base meta.helm.sh/release-namespace=istio-system --overwrite 2>/dev/null; kubectl label "$crd" app.kubernetes.io/managed-by=Helm --overwrite 2>/dev/null; done || true
+kubectl annotate crd istiooperators.install.istio.io meta.helm.sh/release-name=istio-base meta.helm.sh/release-namespace=istio-system --overwrite 2>/dev/null || true
+kubectl label crd istiooperators.install.istio.io app.kubernetes.io/managed-by=Helm --overwrite 2>/dev/null || true
+
+# Patch nexus
+kubectl get cm,sts,svc,destinationrule -n rafay-core -o json | jq -r '.items[] | select(.metadata.annotations["meta.helm.sh/release-name"]=="rafay-core") | select(.metadata.name|test("nexus")) | "\(.kind)/\(.metadata.name)"' | while read -r r; do kubectl annotate -n rafay-core "$r" meta.helm.sh/release-name=rafay-repo meta.helm.sh/release-namespace=rafay-core --overwrite 2>/dev/null; kubectl label -n rafay-core "$r" app.kubernetes.io/managed-by=Helm --overwrite 2>/dev/null; done || true
+
+# Delete nexus StatefulSet -- spec changes require delete + recreate.
+# Annotation alone is not enough for StatefulSet spec changes.
+kubectl delete sts nexus -n rafay-core --ignore-not-found=true 2>/dev/null || true
+kubectl delete sts clickhouse -n rafay-core --ignore-not-found=true 2>/dev/null || true
+
+# Patch redis
+kubectl annotate ds redis-replicas -n rafay-core meta.helm.sh/release-name=redis meta.helm.sh/release-namespace=rafay-core --overwrite 2>/dev/null && kubectl label ds redis-replicas -n rafay-core app.kubernetes.io/managed-by=Helm --overwrite 2>/dev/null || true
+kubectl annotate deploy redis-master -n rafay-core meta.helm.sh/release-name=redis meta.helm.sh/release-namespace=rafay-core --overwrite 2>/dev/null && kubectl label deploy redis-master -n rafay-core app.kubernetes.io/managed-by=Helm --overwrite 2>/dev/null || true
+
+# Delete prometheus stack
+kubectl delete $(kubectl api-resources --verbs=list --namespaced -o name | tr '\n' ',' | sed 's/,$//') -l app.kubernetes.io/part-of=kube-prometheus-stack -n rafay-core 2>/dev/null || true
+
+[config_patches]
+
+# Nothing needed for this hop -- storageClass and every other field
+# carry forward unchanged from 3.1-39's config.yaml.
+
+[after_radm_dependency]
+
+# Nothing needed for this hop yet.
+
+[after_radm_application]
+
+# Nothing needed for this hop yet.
+
+[post_commands]
+
+# Enable paas-api DAY2 operations
+kubectl set env deployment/paas-api WORKSPACE_API_ALLOW_DAY2_OPERATIONS=true -n rafay-core 2>/dev/null || true
+
+[after_radm_cluster]
+
+# Nothing needed for this hop yet.
