@@ -1,37 +1,42 @@
 """
 lib/upgrade/upgrade_engine.py
 
-UPDATED per team design review (2026-07-22):
-  - No more hop-file lookup. lib/upgrade/hops/ is no longer imported or
-    referenced anywhere -- confirmed via repo-wide grep that get_hop()
-    had no callers outside this file and its own package. The hops/
-    directory can be deleted entirely.
-  - pre_commands / after_radm_dependency_commands / after_radm_application_commands
-    are now passed in DIRECTLY as constructor arguments -- sourced from
-    the three Jenkins textboxes (base64-decoded in conftest.py before
-    reaching here), not looked up from any file.
-  - src_package_url / dst_package_url are now the primary inputs (full
-    URLs, passed directly from Jenkins) -- package "name" is derived via
-    a simple URL basename split (url.rsplit('/', 1)[-1]), which is 100%
-    reliable since it's just splitting a path, not parsing a version out
-    of a filename.
-  - src_version / dst_version are now PURELY COSMETIC -- best-effort
-    labels for print statements/logging only. No behavior in this class
-    depends on them being correct, since there is no more per-version
-    hop lookup to get wrong.
+UPDATED (2026-08-12): patch-command sourcing moved fully to
+utils/helpers.py's load_canned_patch_commands() + config/patches/,
+called from conftest.py -- NOT looked up inside this class. This engine
+just takes six plain command lists as constructor args and runs them at
+the right point. lib/upgrade/hops/ is not used by this file (superseded
+by config/patches/ -- see config/patches/README.md for the "add a new
+version pair" workflow). controller_type/src_version/dst_version are
+NOT needed by this class for lookup purposes -- src_version/dst_version
+remain cosmetic log labels only, matching the pre-hop-experiment design.
+
+Three of the six command lists are typically "canned (from
+config/patches/) + Jenkins textbox" merges, done by the CALLER
+(conftest.py) before construction -- this class doesn't know or care
+where a given list's commands came from, it just runs them in order:
+  pre_commands, after_radm_dependency_commands, after_radm_application_commands
+
+The other three have no Jenkins textbox equivalent, so the caller passes
+canned-only lists (or [] if nothing canned exists for that pair):
+  config_patches, post_commands, after_radm_cluster_commands
 
 Phases, in the order they run:
-  1.  pre_commands             — passed in directly (from Jenkins textbox)
+  1.  pre_commands             — from conftest.py (canned + Jenkins)
   2.  download                 — new package via aria2c
   3.  extract                  — new package via pigz/tar
-  4.  create_config            — copy template, patch fields from old config
+  4.  create_config            — copy template, patch archive-directory,
+                                  then apply config_patches
   5.  copy_radm                — new radm → /usr/bin/
   6.  radm dependency          — always same, NEW package only
-      after_radm_dependency_commands — passed in directly (from Jenkins textbox)
+      after_radm_dependency_commands — from conftest.py (canned + Jenkins)
   7.  wait elasticsearch       — wait for green
   8.  radm application         — always same, NEW package only
-      after_radm_application_commands — passed in directly (from Jenkins textbox)
-  9.  radm cluster             — NEW package only (single pass)
+      after_radm_application_commands — from conftest.py (canned + Jenkins)
+  9.  post_commands            — canned only, right before radm cluster
+  10. radm cluster              — NEW package only (single pass)
+      after_radm_cluster_commands — canned only, before final pod polling
+  11. final pod-health polling
 """
 
 import re
@@ -59,15 +64,25 @@ class UpgradeEngine:
         pre_commands: list = None,
         after_radm_dependency_commands: list = None,
         after_radm_application_commands: list = None,
+        config_patches: list = None,
+        post_commands: list = None,
+        after_radm_cluster_commands: list = None,
     ):
         self.ssh         = ssh_client
         self.install_dir = install_dir
         self.star_domain = star_domain
         self.nsg         = nsg_manager
 
+        # All six command lists are handed in as-is -- this class doesn't
+        # know or care whether a given list came from config/patches/,
+        # a Jenkins textbox, both merged, or neither. See conftest.py's
+        # controller_upgrade fixture for where that merging happens.
         self.pre_commands = pre_commands or []
         self.after_radm_dependency_commands = after_radm_dependency_commands or []
         self.after_radm_application_commands = after_radm_application_commands or []
+        self.config_patches = config_patches or []
+        self.post_commands = post_commands or []
+        self.after_radm_cluster_commands = after_radm_cluster_commands or []
 
         # Package name is JUST the URL's last path segment -- a plain
         # string split, not a version-parsing regex. This is safe
@@ -91,9 +106,7 @@ class UpgradeEngine:
         """
         Best-effort label for logs only -- e.g. "rafay-airgapped-controller-
         v3.1-40-1.tar.gz" -> "3.1-40-1". Falls back to the full package
-        name if nothing matches. Never used for any control-flow decision,
-        so a wrong/partial match here has zero functional impact -- it
-        only affects how readable the console log is.
+        name if nothing matches. Never used for any control-flow decision.
         """
         m = re.search(r'v?([\d.]+(?:-\d+)*)\.tar\.gz', package_name)
         return m.group(1) if m else package_name
@@ -122,7 +135,12 @@ class UpgradeEngine:
         self._phase("radm_application", self._radm_application)
         self._run_commands("after_radm_application", self.after_radm_application_commands)
 
+        self._run_commands("post", self.post_commands)
+
         self._phase("radm_cluster", self._radm_cluster)
+        self._run_commands("after_radm_cluster", self.after_radm_cluster_commands)
+        self._phase("poll_after_radm_cluster",
+                     lambda: self._poll_pods(PHASE_WAIT["radm_cluster"], "after radm cluster"))
 
         print("\n" + "═" * 60)
         print(f"[upgrade] ✅ Upgrade complete: {self.src_version} → {self.dst_version}")
@@ -140,14 +158,14 @@ class UpgradeEngine:
 
     def _run_commands(self, cmd_type: str, commands: list):
         """
-        Warns on failure -- never stops the upgrade. These commands come
-        straight from a Jenkins textbox with no review, so treating any
-        one line's failure as fatal would make one typo abort an entire
-        real upgrade run -- warn-and-continue matches how pre/post
-        commands have always behaved in this engine.
+        Warns on failure -- never stops the upgrade, matching how
+        pre/post commands have always behaved in this engine (commands
+        should end with `|| true` themselves if they're allowed to fail
+        silently; this wrapper additionally never lets ANY single
+        command's exception or non-zero exit abort the whole run).
         """
         if not commands:
-            print(f"[upgrade] No {cmd_type} commands provided")
+            print(f"[upgrade] No {cmd_type} commands to run")
             return
         print(f"\n[upgrade] ── {cmd_type.upper()} COMMANDS ({len(commands)} total) " + "─" * 20)
         for i, cmd in enumerate(commands, 1):
@@ -159,7 +177,7 @@ class UpgradeEngine:
             except Exception as e:
                 print(f"[upgrade] ⚠ WARNING: {e} — continuing")
 
-    # ── Phase implementations (unchanged from previous version) ──────────────
+    # ── Phase implementations ─────────────────────────────────────────────────
 
     def _download_new_package(self):
         tar_path = f"{self.install_dir}/{self.dst_package}"
@@ -213,6 +231,12 @@ class UpgradeEngine:
         self.ssh.run(f"sudo sed -i 's|archive-directory: RAFAY_PH|archive-directory: {self.dst_extract_dir}|' {new_config}")
         print(f"[create_upgrade_config] ✓ archive-directory: {self.dst_extract_dir}")
 
+        # Version-specific field edits from config/patches/.../config_patches.txt
+        # (if one exists for this src->dst pair), run against the NEW
+        # config.yaml right after it's created -- before any radm command
+        # reads it.
+        self._run_commands("config_patches", self.config_patches)
+
     def _copy_new_radm(self):
         out, rc = self.ssh.run(
             f"sudo cp {self.dst_extract_dir}/radm /usr/bin/radm && sudo chmod +x /usr/bin/radm && echo OK"
@@ -255,13 +279,19 @@ class UpgradeEngine:
         self._poll_pods(PHASE_WAIT["radm_application"], "after radm application")
 
     def _radm_cluster(self):
+        """
+        Runs `radm cluster` only. Pod-health polling for this phase is
+        deliberately NOT done here -- it runs separately in run(), after
+        after_radm_cluster_commands, so a canned
+        config/patches/.../after_radm_cluster.txt (if one exists) gets to
+        run before polling starts, not after.
+        """
         print(f"[radm_cluster] Running from {self.dst_extract_dir} ...")
         out, rc = self.ssh.run_stream(
             f"cd {self.dst_extract_dir} && sudo ./radm cluster --config config.yaml 2>&1",
             timeout=2400, prefix="[radm cluster]",
         )
         assert rc == 0, f"radm cluster failed (exit {rc}): {out[-300:]}"
-        self._poll_pods(PHASE_WAIT["radm_cluster"], "after radm cluster")
 
     def _poll_pods(self, cfg: dict, label: str):
         deadline = time.time() + cfg["max_wait"]

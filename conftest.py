@@ -8,7 +8,9 @@ from utils.config_loader import (
     load_config,
     load_package_profile,
 )
-
+from lib.aws.ssm_manager import SSMManager
+from lib.backup_restore.br_manager import BackupRestoreManager
+from utils.helpers import load_canned_patch_commands
 
 def decode_commands(b64_str: str) -> list:
     """
@@ -66,6 +68,12 @@ def pytest_addoption(parser):
                      help="Full URL for the destination (upgrade target) package")
     parser.addoption("--skip-upgrade",    action="store_true", default=False,
                      help="Skip upgrade — run validation only")
+    parser.addoption("--src-version", default=None,
+                     help="Plain src version label from Jenkins (e.g. '3.1-39'). "
+                          "Optional -- omit when invoking pytest directly.")
+    parser.addoption("--dst-version", default=None,
+                     help="Plain dst version label from Jenkins (e.g. '3.1-40-1'). "
+                          "Optional -- omit when invoking pytest directly.")
 
     # ── Ad-hoc patch commands -- from the three Jenkins checkbox+textarea
     # pairs. Base64-encoded to survive the trip through a Groovy sh step
@@ -80,6 +88,14 @@ def pytest_addoption(parser):
                      help="Base64-encoded commands to run after radm dependency")
     parser.addoption("--after-application-commands-b64", default=None,
                      help="Base64-encoded commands to run after radm application")
+
+    # ── Backup & restore flags ──────────────────────────────────────────────
+    parser.addoption("--aws-profile",     default=None,   help="AWS profile name from ~/.aws/credentials (e.g. dev-noc)")
+    parser.addoption("--instance-id",     default="i-0e38286eeff640732", help="SSM instance ID of dev-noc")
+    parser.addoption("--region",          default="us-west-1", help="AWS region for SSM")
+    parser.addoption("--s3-region",       default="us-west-2", help="AWS region for the S3 bucket")
+    parser.addoption("--br-poll-interval", action="store", type=int, default=10, help="Seconds between log polls")
+    parser.addoption("--br-max-wait",     action="store", type=int, default=7200, help="Max seconds to wait for the full backup-restore run")
 
     # ── Signed cert (Let's Encrypt via Route53 DNS-01) ────────────────────────
     parser.addoption("--signed-cert",     action="store_true", default=False,
@@ -425,16 +441,41 @@ def controller_upgrade(
 
     from lib.upgrade.upgrade_engine import UpgradeEngine
 
-    pre_commands = decode_commands(request.config.getoption("--pre-dependency-commands-b64"))
-    after_dependency_commands = decode_commands(request.config.getoption("--after-dependency-commands-b64"))
-    after_application_commands = decode_commands(request.config.getoption("--after-application-commands-b64"))
+    # Canned commands (config/hops/<src>__to__<dst>.txt -- ONE file per
+    # version pair, section-delimited, see utils/helpers.py) run first at
+    # each hook; whatever Jenkins passed in the textbox runs after, as an
+    # additive extra rather than a replacement. Three stages
+    # (config_patches, post_commands, after_radm_cluster) have no Jenkins
+    # textbox at all -- canned is the only source for those.
+    canned = load_canned_patch_commands(
+        src_package_url=package_profile.url,
+        dst_package_url=dst_package_url,
+        src_version=request.config.getoption("--src-version"),
+        dst_version=request.config.getoption("--dst-version"),
+    )
+
+    pre_commands = canned["pre_commands"] + decode_commands(request.config.getoption("--pre-dependency-commands-b64"))
+    after_dependency_commands = canned["after_radm_dependency"] + decode_commands(request.config.getoption("--after-dependency-commands-b64"))
+    after_application_commands = canned["after_radm_application"] + decode_commands(request.config.getoption("--after-application-commands-b64"))
+
+    config_patches = canned["config_patches"]
+    post_commands = canned["post_commands"]
+    after_radm_cluster_commands = canned["after_radm_cluster"]
+
+    for key, label in [
+        ("pre_commands", "pre-dependency"), ("config_patches", "config_patches"),
+        ("after_radm_dependency", "after-dependency"), ("after_radm_application", "after-application"),
+        ("post_commands", "post"), ("after_radm_cluster", "after-radm-cluster"),
+    ]:
+        if canned[key]:
+            print(f"[conftest] {len(canned[key])} canned {label} command(s) loaded from config/hops/")
 
     if pre_commands:
-        print(f"[conftest] {len(pre_commands)} pre-dependency command(s) supplied via Jenkins")
+        print(f"[conftest] {len(pre_commands)} total pre-dependency command(s) (canned + Jenkins)")
     if after_dependency_commands:
-        print(f"[conftest] {len(after_dependency_commands)} after-dependency command(s) supplied via Jenkins")
+        print(f"[conftest] {len(after_dependency_commands)} total after-dependency command(s) (canned + Jenkins)")
     if after_application_commands:
-        print(f"[conftest] {len(after_application_commands)} after-application command(s) supplied via Jenkins")
+        print(f"[conftest] {len(after_application_commands)} total after-application command(s) (canned + Jenkins)")
 
     # Resolve star_domain
     if controller_fqdn:
@@ -454,6 +495,9 @@ def controller_upgrade(
         pre_commands=pre_commands,
         after_radm_dependency_commands=after_dependency_commands,
         after_radm_application_commands=after_application_commands,
+        config_patches=config_patches,
+        post_commands=post_commands,
+        after_radm_cluster_commands=after_radm_cluster_commands,
     )
 
     try:
@@ -481,3 +525,38 @@ def extras(extra):
     Works with both old (extra) and new (extras) pytest-html APIs.
     """
     return extra
+
+@pytest.fixture(scope="session")
+def aws_creds(request):
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_KEY")
+    profile = request.config.getoption("--aws-profile")
+    if not profile and (not access_key or not secret_key):
+        pytest.skip("No AWS credentials: set --aws-profile or "
+                     "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY")
+    return {"access_key": access_key, "secret_key": secret_key, "profile": profile}
+
+
+@pytest.fixture(scope="session")
+def ssm_manager(request, aws_creds):
+    return SSMManager(
+        region=request.config.getoption("--region"),
+        profile=aws_creds["profile"],
+        access_key=aws_creds["access_key"],
+        secret_key=aws_creds["secret_key"],
+    )
+
+
+@pytest.fixture(scope="session")
+def br_manager(request, ssm_manager):
+    instance_id = request.config.getoption("--instance-id")
+    ssm_manager.check_instance_online(instance_id)
+    return BackupRestoreManager(ssm_manager, instance_id)
+
+
+@pytest.fixture(scope="session")
+def build_no(request):
+    val = request.config.getoption("--build-no")
+    if not val:
+        pytest.skip("--build-no not provided")
+    return val
