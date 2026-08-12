@@ -20,6 +20,29 @@ _PATCH_SECTIONS = [
 _SECTION_RE = re.compile(r"^\[([a-z_]+)\]\s*$")
 
 
+def normalize_version(version: str) -> str:
+    """
+    Normalizes a version string to the dash-separated form used in hop
+    filenames, regardless of whether Jenkins/versions.json passed it
+    dotted or already dashed.
+
+        "3.1.39"    -> "3.1-39"      (Jenkins/versions.json dotted form)
+        "3.1.40-2"  -> "3.1-40-2"    (dotted form with patch suffix)
+        "3.1-39"    -> "3.1-39"      (already dash form -- unchanged)
+        "3.5"       -> "3.5"         (General series, 2 segments -- unchanged)
+
+    Rule: keep the first two dot-separated segments joined by a dot
+    (major.minor), join everything after that with dashes. Idempotent --
+    safe to call on a value that's already in either form.
+    """
+    if not version:
+        return version
+    parts = version.split(".")
+    if len(parts) >= 3:
+        return ".".join(parts[:2]) + "-" + "-".join(parts[2:])
+    return version
+
+
 def _parse_patch_file(path: str) -> dict:
     """
     Parses a single [section]-delimited patch file into
@@ -81,8 +104,8 @@ def load_canned_patch_commands(src_package_url: str, dst_package_url: str,
     if patches_root is None:
         patches_root = str(Path(__file__).parent.parent / "config" / "hops")
 
-    key_src = src_version or src_package_url.rsplit("/", 1)[-1].replace(".tar.gz", "")
-    key_dst = dst_version or dst_package_url.rsplit("/", 1)[-1].replace(".tar.gz", "")
+    key_src = normalize_version(src_version) or src_package_url.rsplit("/", 1)[-1].replace(".tar.gz", "")
+    key_dst = normalize_version(dst_version) or dst_package_url.rsplit("/", 1)[-1].replace(".tar.gz", "")
     patch_file = os.path.join(patches_root, f"{key_src}__to__{key_dst}.txt")
 
     if not os.path.isfile(patch_file):
