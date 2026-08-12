@@ -8,8 +8,6 @@ from utils.config_loader import (
     load_config,
     load_package_profile,
 )
-from lib.aws.ssm_manager import SSMManager
-from lib.backup_restore.br_manager import BackupRestoreManager
 from utils.helpers import load_canned_patch_commands
 
 def decode_commands(b64_str: str) -> list:
@@ -539,6 +537,7 @@ def aws_creds(request):
 
 @pytest.fixture(scope="session")
 def ssm_manager(request, aws_creds):
+    from lib.aws.ssm_manager import SSMManager
     return SSMManager(
         region=request.config.getoption("--region"),
         profile=aws_creds["profile"],
@@ -549,6 +548,7 @@ def ssm_manager(request, aws_creds):
 
 @pytest.fixture(scope="session")
 def br_manager(request, ssm_manager):
+    from lib.backup_restore.br_manager import BackupRestoreManager
     instance_id = request.config.getoption("--instance-id")
     ssm_manager.check_instance_online(instance_id)
     return BackupRestoreManager(ssm_manager, instance_id)
