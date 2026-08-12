@@ -1,0 +1,71 @@
+{
+    "controller_types": {
+  
+      "General": {
+        "default_ssh_user": "ubuntu",
+        "versions": {
+  
+          "3.5": {
+            "package_url": "https://CHANGE-ME/rafay-controller-3.5.tar.gz",
+            "notes": "Oldest supported General release.",
+            "can_upgrade_to": ["3.7"]
+          },
+          "3.7": {
+            "package_url": "https://CHANGE-ME/rafay-controller-3.7.tar.gz",
+            "notes": "",
+            "can_upgrade_to": ["4.0"]
+          },
+          "4.0": {
+            "package_url": "https://CHANGE-ME/rafay-controller-4.0.tar.gz",
+            "notes": "",
+            "can_upgrade_to": ["4.2"]
+          },
+          "4.2": {
+            "package_url": "https://CHANGE-ME/rafay-controller-4.2.tar.gz",
+            "notes": "Latest General release. No further hop defined yet.",
+            "can_upgrade_to": []
+          }
+  
+        }
+      },
+  
+      "GPU-PaaS": {
+        "default_ssh_user": "ubuntu",
+        "versions": {
+  
+          "3.1.37": {
+            "package_url": "https://CHANGE-ME/rafay-airgapped-controller-v3.1-37.tar.gz",
+            "notes": "Oldest supported GPU-PaaS release.",
+            "can_upgrade_to": ["3.1.37-2"]
+          },
+          "3.1.37-2": {
+            "package_url": "https://CHANGE-ME/rafay-airgapped-controller-v3.1-37-2.tar.gz",
+            "notes": "Branch point: can go to either 3.1.38 or 3.1.38-2 from here.",
+            "can_upgrade_to": ["3.1.38", "3.1.38-2"]
+          },
+          "3.1.38": {
+            "package_url": "https://CHANGE-ME/rafay-airgapped-controller-v3.1-38.tar.gz",
+            "notes": "Dead-end branch -- no further hop defined from 3.1.38 yet.",
+            "can_upgrade_to": []
+          },
+          "3.1.38-2": {
+            "package_url": "https://CHANGE-ME/rafay-airgapped-controller-v3.1-38-2.tar.gz",
+            "notes": "",
+            "can_upgrade_to": ["3.1.40-1"]
+          },
+          "3.1.39": {
+            "package_url": "https://CHANGE-ME/rafay-airgapped-controller-v3.1-39.tar.gz",
+            "notes": "Separate entry point -- not reachable via a hop from 3.1.37, only used as its own src_version.",
+            "can_upgrade_to": ["3.1.40-1"]
+          },
+          "3.1.40-1": {
+            "package_url": "https://CHANGE-ME/rafay-airgapped-controller-v3.1-40-1.tar.gz",
+            "notes": "Latest GPU-PaaS release. No further hop defined yet.",
+            "can_upgrade_to": []
+          }
+  
+        }
+      }
+  
+    }
+  }
