@@ -1,0 +1,62 @@
+# config/hops/4.0__to__4.2.txt
+#
+# Canned patch commands for the General 4.0 -> 4.2 upgrade.
+
+#
+#   [pre_commands]           before download/radm phases run at all
+#   [new config.yaml created from old config.yaml + archive-directory patch]
+#   [config_patches]         version-specific field edits against the
+#                            NEW config.yaml, right after it's created
+#   [radm dependency runs -- NEW package only]
+#   [after_radm_dependency]  right after radm dependency completes
+#   [radm application runs -- NEW package only]
+#   [after_radm_application] right after radm application completes
+#   [post_commands]          right before radm cluster runs
+#   [radm cluster runs -- NEW package only]
+#   [after_radm_cluster]     right after radm cluster completes,
+#                            before final pod-health polling
+#
+
+[pre_commands]
+
+# Install helm
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 | bash
+
+# Cleanup tmp
+sudo rm -rf /tmp/radm.log /tmp/rafay-dep* /tmp/rafay-cluster* /tmp/rafay-core* /tmp/istio-* 2>/dev/null || true
+
+# Install pigz for faster extraction
+sudo apt-get -o Acquire::ForceIPv4=true install -y pigz 2>&1 || true
+
+# Patch the istio CRDs, nexus
+for crd in $(kubectl get crd -o name | grep -E '\.istio\.io$'); do echo "Patching $crd"; kubectl annotate "$crd" meta.helm.sh/release-name=istio-base meta.helm.sh/release-namespace=istio-system --overwrite; kubectl label "$crd" app.kubernetes.io/managed-by=Helm --overwrite; done
+kubectl annotate crd istiooperators.install.istio.io meta.helm.sh/release-name=istio-base meta.helm.sh/release-namespace=istio-system --overwrite 2>/dev/null
+kubectl label crd istiooperators.install.istio.io app.kubernetes.io/managed-by=Helm --overwrite 2>/dev/null
+kubectl get cm,sts,svc,destinationrule -n rafay-core -o json | jq -r '.items[] | select(.metadata.annotations["meta.helm.sh/release-name"]=="rafay-core") | select(.metadata.name|test("nexus")) | "\(.kind)/\(.metadata.name)"' | while read -r r; do kubectl annotate -n rafay-core "$r" meta.helm.sh/release-name=rafay-repo meta.helm.sh/release-namespace=rafay-core --overwrite; kubectl label -n rafay-core "$r" app.kubernetes.io/managed-by=Helm --overwrite; done
+kubectl delete pod -n rafay-core nexus-0 --force --grace-period=0
+
+[config_patches]
+
+
+[after_radm_dependency]
+
+# NOTE: waiting for the ES/Kibana *-cluster CRDs to reach PHASE=Ready
+# (and VERSION=9.4.2, see [expected_es_version] below) is handled
+# automatically by UpgradeEngine's dedicated wait_elasticsearch phase --
+# it runs right after this section's commands and before radm
+# application, with a proper multi-minute poll budget. Nothing needed
+# here -- a raw wait/watch command in this section would only get a
+# 120s timeout before being warned-and-skipped, which isn't long enough
+# for real cluster readiness.
+
+[after_radm_application]
+
+
+[post_commands]
+
+
+[after_radm_cluster]
+
+
+[expected_es_version]
+9.4.2

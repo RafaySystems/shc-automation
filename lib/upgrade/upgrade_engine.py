@@ -67,6 +67,7 @@ class UpgradeEngine:
         config_patches: list = None,
         post_commands: list = None,
         after_radm_cluster_commands: list = None,
+        expected_es_version: str = None,
     ):
         self.ssh         = ssh_client
         self.install_dir = install_dir
@@ -82,6 +83,7 @@ class UpgradeEngine:
         self.after_radm_application_commands = after_radm_application_commands or []
         self.config_patches = config_patches or []
         self.post_commands = post_commands or []
+        self.expected_es_version = expected_es_version
         self.after_radm_cluster_commands = after_radm_cluster_commands or []
 
         # Package name is JUST the URL's last path segment -- a plain
@@ -130,7 +132,7 @@ class UpgradeEngine:
         self._phase("radm_dependency", self._radm_dependency)
         self._run_commands("after_radm_dependency", self.after_radm_dependency_commands)
 
-        self._phase("wait_elasticsearch", self._wait_elasticsearch)
+        self._phase("wait_elasticsearch", lambda: self._wait_elasticsearch(self.expected_es_version))
 
         self._phase("radm_application", self._radm_application)
         self._run_commands("after_radm_application", self.after_radm_application_commands)
@@ -253,21 +255,57 @@ class UpgradeEngine:
         assert rc == 0, f"radm dependency failed (exit {rc}): {out[-300:]}"
         self._poll_pods(PHASE_WAIT["radm_dependency"], "after radm dependency")
 
-    def _wait_elasticsearch(self):
+    def _wait_elasticsearch(self, expected_version: str = None):
+        """
+        Waits for the ECK Elasticsearch/Kibana CRDs to report PHASE=Ready.
+
+        Only resources whose NAME ends in "-cluster" (e.g.
+        rafay-es-cluster, rafay-kibana-cluster) are checked -- some
+        environments also run legacy standalone instances (e.g.
+        rafay-es, rafay-kibana) that intentionally stay on their own
+        older version and are NOT part of this upgrade's rollout. Gating
+        on ALL es/kibana resources would mean this phase can never
+        succeed in an environment where those legacy instances exist,
+        since they'll never reach expected_version -- it would just
+        silently run out its full timeout on every single upgrade.
+
+        If expected_version is given, ALSO requires every matched
+        *-cluster resource's VERSION column to match it exactly. Leave
+        it as None to accept any version, as long as PHASE=Ready.
+        """
         cfg = PHASE_WAIT["elasticsearch"]
         deadline = time.time() + cfg["max_wait"]
-        attempt = 0
         while time.time() < deadline:
-            attempt += 1
-            out, rc = self.ssh.run("kubectl get es,kibana -A --no-headers 2>/dev/null || echo NOT_READY")
+            out, rc = self.ssh.run(
+                "kubectl get es,kibana -A --no-headers "
+                "-o custom-columns=KIND:.kind,NAME:.metadata.name,PHASE:.status.phase,VERSION:.status.version "
+                "2>/dev/null || echo NOT_READY"
+            )
             if rc == 0 and "NOT_READY" not in out and out.strip():
-                lines = [l for l in out.splitlines() if l.strip()]
-                not_green = [l for l in lines if "green" not in l.lower()]
-                if not not_green:
-                    print("[wait_elasticsearch] all green ✓")
-                    return
+                all_lines = [l.split() for l in out.splitlines() if l.strip()]
+                # KIND NAME PHASE VERSION -- only the -cluster resources
+                # matter for this gate.
+                lines = [l for l in all_lines if len(l) >= 2 and l[1].endswith("-cluster")]
+                if not lines:
+                    print("[wait_elasticsearch] no *-cluster ES/Kibana resources found yet ...")
+                else:
+                    not_ready = [l for l in lines if len(l) < 4 or l[2] != "Ready"]
+                    wrong_version = (
+                        [l for l in lines if len(l) >= 4 and l[3] != expected_version]
+                        if expected_version else []
+                    )
+                    if not not_ready and not wrong_version:
+                        versions = {l[3] for l in lines if len(l) >= 4}
+                        print(f"[wait_elasticsearch] all *-cluster resources Ready ✓ (version: {', '.join(versions) or 'unknown'})")
+                        return
+                    if not_ready:
+                        names = [l[1] for l in not_ready]
+                        print(f"[wait_elasticsearch] waiting on not-yet-Ready: {names} ...")
+                    elif wrong_version:
+                        names_versions = {(l[1], l[3]) for l in wrong_version}
+                        print(f"[wait_elasticsearch] Ready but version mismatch (want {expected_version}): {names_versions} ...")
             time.sleep(cfg["interval"])
-        print(f"[wait_elasticsearch] ⚠ Timeout — continuing anyway")
+        print(f"[wait_elasticsearch] ⚠ Timeout after {cfg['max_wait']}s — continuing anyway")
 
     def _radm_application(self):
         print("[radm_application] Running ...")
