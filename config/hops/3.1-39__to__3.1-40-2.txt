@@ -35,6 +35,8 @@
 # "old package" radm cluster pass.
 
 [pre_commands]
+#Install helm
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 | bash
 
 # Cleanup tmp
 sudo rm -rf /tmp/radm.log /tmp/rafay-dep* /tmp/rafay-cluster* /tmp/rafay-core* /tmp/istio-* 2>/dev/null || true
@@ -65,6 +67,14 @@ kubectl annotate deploy redis-master -n rafay-core meta.helm.sh/release-name=red
 # Delete prometheus stack
 kubectl delete $(kubectl api-resources --verbs=list --namespaced -o name | tr '\n' ',' | sed 's/,$//') -l app.kubernetes.io/part-of=kube-prometheus-stack -n rafay-core 2>/dev/null || true
 
+#Delete all the rafay-tsdb related entries
+helm uninstall -n rafay-core promscale rafay-tsdb promscale-read
+kubectl delete secrets -n rafay-core rafay-tsdb-certificate rafay-tsdb-credentials rafay-tsdb-pgbackrest
+kubectl delete sts -n rafay-core rafay-tsdb
+kubectl delete pvc -n rafay-core    storage-volume-rafay-tsdb-0 storage-volume-rafay-tsdb-1 wal-volume-rafay-tsdb-0 wal-volume-rafay-tsdb-1 storage-volume-rafay-tsdb-2 wal-volume-rafay-tsdb-2
+kubectl delete svc -n rafay-core rafay-tsdb rafay-tsdb-config rafay-tsdb-replica
+kubectl delete ep -n rafay-core rafay-tsdb rafay-tsdb-config rafay-tsdb-replica
+
 [config_patches]
 
 # Nothing needed for this hop -- storageClass and every other field
@@ -76,7 +86,7 @@ kubectl delete $(kubectl api-resources --verbs=list --namespaced -o name | tr '\
 
 [after_radm_application]
 
-# Nothing needed for this hop yet.
+kubectl get postgresql -A
 
 [post_commands]
 
