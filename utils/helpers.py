@@ -7,7 +7,8 @@ from pathlib import Path
 
 # Section names match UpgradeEngine's hook stages exactly -- no
 # translation layer needed between this file's keys and the engine's
-# constructor args.
+# constructor args. These six are LIST sections -- each line is a
+# separate command, in order.
 _PATCH_SECTIONS = [
     "pre_commands",
     "config_patches",
@@ -16,6 +17,15 @@ _PATCH_SECTIONS = [
     "post_commands",
     "after_radm_cluster",
 ]
+
+# SCALAR sections hold exactly one value, not a list of commands -- the
+# first non-comment line found wins; a second line under the same
+# section is an error rather than silently ignored or appended.
+_SCALAR_SECTIONS = [
+    "expected_es_version",
+]
+
+_ALL_SECTIONS = _PATCH_SECTIONS + _SCALAR_SECTIONS
 
 _SECTION_RE = re.compile(r"^\[([a-z_]+)\]\s*$")
 
@@ -46,14 +56,21 @@ def normalize_version(version: str) -> str:
 def _parse_patch_file(path: str) -> dict:
     """
     Parses a single [section]-delimited patch file into
-    {"pre_commands": [...], "config_patches": [...], ...}.
+    {"pre_commands": [...], ..., "expected_es_version": None or "x.y.z"}.
 
-    Comments (#) and blank lines are ignored everywhere. A command line
-    found before any [section] header, or a section name that isn't one
-    of _PATCH_SECTIONS, raises ValueError -- fail loudly on a malformed
-    file rather than silently dropping commands.
+    The six _PATCH_SECTIONS are lists -- each line is a separate command,
+    in order. The _SCALAR_SECTIONS (currently just expected_es_version)
+    hold exactly one value -- a second line under the same scalar
+    section raises ValueError rather than silently overwriting or
+    appending.
+
+    Comments (#) and blank lines are ignored everywhere. A line found
+    before any [section] header, or a section name that isn't one of
+    _ALL_SECTIONS, also raises ValueError -- fail loudly on a malformed
+    file rather than silently dropping content.
     """
     result = {s: [] for s in _PATCH_SECTIONS}
+    result.update({s: None for s in _SCALAR_SECTIONS})
     current = None
     with open(path) as f:
         for lineno, raw_line in enumerate(f, start=1):
@@ -63,19 +80,28 @@ def _parse_patch_file(path: str) -> dict:
             m = _SECTION_RE.match(line)
             if m:
                 name = m.group(1)
-                if name not in result:
+                if name not in _ALL_SECTIONS:
                     raise ValueError(
                         f"{path}:{lineno}: unknown section [{name}] -- "
-                        f"expected one of {_PATCH_SECTIONS}"
+                        f"expected one of {_ALL_SECTIONS}"
                     )
                 current = name
                 continue
             if current is None:
                 raise ValueError(
-                    f"{path}:{lineno}: command found before any [section] "
+                    f"{path}:{lineno}: content found before any [section] "
                     f"header: {line!r}"
                 )
-            result[current].append(line)
+            if current in _SCALAR_SECTIONS:
+                if result[current] is not None:
+                    raise ValueError(
+                        f"{path}:{lineno}: [{current}] already has a value "
+                        f"({result[current]!r}) -- only one line allowed "
+                        f"in a scalar section, found a second: {line!r}"
+                    )
+                result[current] = line
+            else:
+                result[current].append(line)
     return result
 
 
@@ -83,9 +109,11 @@ def load_canned_patch_commands(src_package_url: str, dst_package_url: str,
                                  src_version: str = None, dst_version: str = None,
                                  patches_root: str = None) -> dict:
     """
-    Returns a dict with all six _PATCH_SECTIONS keys, each a list of
-    command strings (possibly empty). Missing file -> all-empty dict,
-    not an error -- most src->dst pairs won't need a canned patch at all.
+    Returns a dict with all six _PATCH_SECTIONS keys (each a list of
+    command strings, possibly empty) plus all _SCALAR_SECTIONS keys
+    (each a single string or None). Missing file -> all-empty/None
+    dict, not an error -- most src->dst pairs won't need a canned
+    patch at all.
 
     Lookup key preference:
       1. Explicit src_version/dst_version if given -- the normal path
@@ -98,6 +126,7 @@ def load_canned_patch_commands(src_package_url: str, dst_package_url: str,
          requiring --src-version/--dst-version to be passed.
     """
     empty = {s: [] for s in _PATCH_SECTIONS}
+    empty.update({s: None for s in _SCALAR_SECTIONS})
     if not src_package_url or not dst_package_url:
         return empty
 
