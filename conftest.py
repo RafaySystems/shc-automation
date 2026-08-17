@@ -10,6 +10,15 @@ from utils.config_loader import (
 )
 from utils.helpers import load_canned_patch_commands
 
+# NOTE: SSMManager / BackupRestoreManager are deliberately NOT imported
+# here at module level. They're imported lazily inside the ssm_manager
+# and br_manager fixtures below instead -- that way a controller-upgrade
+# or bringup-only run never touches lib.aws / lib.backup_restore at all,
+# and pytest collection can't fail over those modules regardless of
+# whether they're present in this checkout. Backup-restore work is being
+# picked back up later; this keeps it fully decoupled from upgrade
+# qualification in the meantime.
+
 def decode_commands(b64_str: str) -> list:
     """
     Decodes a base64-encoded multi-line string (from a Jenkins textarea)
@@ -66,6 +75,13 @@ def pytest_addoption(parser):
                      help="Full URL for the destination (upgrade target) package")
     parser.addoption("--skip-upgrade",    action="store_true", default=False,
                      help="Skip upgrade — run validation only")
+
+    # ── Backup-restore -- runs in the SAME pytest session as bringup/upgrade,
+    # not a separate job. Tests are marked @pytest.mark.backup_restore and
+    # skipped by default (see pytest_collection_modifyitems below) -- this
+    # flag is the single on/off switch for including them in this run.
+    parser.addoption("--run-backup-restore", action="store_true", default=False,
+                     help="Also run backup-restore tests (marked backup_restore) in this session")
     parser.addoption("--src-version", default=None,
                      help="Plain src version label from Jenkins (e.g. '3.1-39'). "
                           "Optional -- omit when invoking pytest directly.")
@@ -99,6 +115,103 @@ def pytest_addoption(parser):
     parser.addoption("--signed-cert",     action="store_true", default=False,
                      help="Issue a Let's Encrypt wildcard cert via Route53 DNS-01 "
                           "instead of the controller's self-signed default")
+
+
+def pytest_collection_modifyitems(config, items):
+    """
+    Backup-restore tests (tests/test_backup_restore.py, marked
+    @pytest.mark.backup_restore) run in the SAME session as bringup/
+    upgrade -- not a separate Jenkins job -- but are SKIPPED by default
+    so a normal bringup/upgrade run never pays the extra time/risk of
+    exercising SSM + backup-restore unless explicitly asked for via
+    --run-backup-restore (wired to a Jenkins checkbox).
+
+    This only affects test SELECTION, not the ssm_manager/br_manager
+    fixtures themselves -- those still lazy-import lib.aws/lib.backup_restore
+    only when a selected test actually requests them, so a skipped
+    backup_restore test never triggers that import at all.
+    """
+    if config.getoption("--run-backup-restore"):
+        return
+    skip_br = pytest.mark.skip(reason="need --run-backup-restore to run backup-restore tests")
+    for item in items:
+        if "backup_restore" in item.keywords:
+            item.add_marker(skip_br)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _write_controller_info_for_downstream(request, controller_profile, raw_config):
+    """
+    Writes controller_info.properties to the workspace root at session
+    end -- NOT for anything inside this repo, purely so the Jenkinsfile's
+    "Trigger Cluster Sanity" stage can read it back via Groovy (same
+    readFile + split('\n') pattern already used for resolved.properties)
+    and pass it as parameters to the downstream Rauto sanity/regression
+    job (airgapped-controller-testing/master).
+
+    Org/username/password preference order:
+      1. request.session._test_org_name / _test_username / _test_password
+         -- set by TestOrgAndUser.test_create_org_and_user
+         (test_console_login.py) AFTER signup actually succeeds. This is
+         the real source of truth: it reflects what was actually created
+         on the controller this run, not just what config intended.
+      2. raw_config["console"]["test_org"] as a fallback, ONLY if signup
+         didn't run this session (e.g. --skip-bringup against an existing
+         controller where TestOrgAndUser was skipped). NOTE the actual
+         key names in that dict are "name"/"email"/"password" -- NOT
+         "org_name"/"username". An earlier version of this fixture used
+         the wrong key names and silently wrote empty strings every time
+         this fallback path was hit; fixed here.
+
+    Runs regardless of test outcome (finalizer always executes), but the
+    Jenkinsfile only triggers the downstream job if THIS session's pytest
+    command itself exited 0.
+    """
+    yield
+    ip = (
+        getattr(request.session, "_tf_ip", None)
+        or getattr(controller_profile, "controller_ip", None)
+        or request.config.getoption("--controller-ip")
+        or ""
+    )
+    fqdn = (
+        getattr(request.session, "_tf_fqdn", None)
+        or getattr(request.session, "_star_domain", None)
+        or ""
+    )
+
+    test_org_cfg = raw_config.get("console", {}).get("test_org", {})
+
+    org_name = (
+        getattr(request.session, "_test_org_name", None)
+        or test_org_cfg.get("name", "")
+    )
+    username = (
+        getattr(request.session, "_test_username", None)
+        or test_org_cfg.get("email", "")
+    )
+    password = (
+        getattr(request.session, "_test_password", None)
+        or test_org_cfg.get("password", "")
+    )
+
+    try:
+        with open("controller_info.properties", "w") as f:
+            f.write(f"CONTROLLER_IP={ip}\n")
+            f.write(f"CONTROLLER_FQDN={fqdn}\n")
+            f.write(f"ORG_NAME={org_name}\n")
+            f.write(f"USERNAME={username}\n")
+            f.write(f"PASSWORD={password}\n")
+        print(f"[conftest] wrote controller_info.properties: CONTROLLER_IP={ip} CONTROLLER_FQDN={fqdn} "
+              f"ORG_NAME={org_name} USERNAME={username} PASSWORD={'*' * len(password) if password else ''}")
+        if not org_name or not username:
+            print("[conftest] ⚠ ORG_NAME or USERNAME empty -- neither request.session._test_org_name/"
+                  "_test_username (post-signup) nor raw_config['console']['test_org']['name'/'email'] "
+                  "(dev.yaml fallback) resolved to a value. Check dev.yaml's console.test_org section, "
+                  "or whether TestOrgAndUser ran this session.")
+    except Exception as e:
+        print(f"[conftest] ⚠ failed to write controller_info.properties: {e} -- "
+              f"downstream sanity trigger (if enabled) won't have controller/login info")
 
 
 @pytest.fixture(scope="session")
@@ -459,6 +572,11 @@ def controller_upgrade(
     config_patches = canned["config_patches"]
     post_commands = canned["post_commands"]
     after_radm_cluster_commands = canned["after_radm_cluster"]
+    expected_es_version = canned["expected_es_version"]
+
+    if expected_es_version:
+        print(f"[conftest] expected_es_version={expected_es_version} loaded from config/hops/ -- "
+              f"wait_elasticsearch will gate on this exact version")
 
     for key, label in [
         ("pre_commands", "pre-dependency"), ("config_patches", "config_patches"),
@@ -496,6 +614,7 @@ def controller_upgrade(
         config_patches=config_patches,
         post_commands=post_commands,
         after_radm_cluster_commands=after_radm_cluster_commands,
+        expected_es_version=expected_es_version,
     )
 
     try:
@@ -537,7 +656,7 @@ def aws_creds(request):
 
 @pytest.fixture(scope="session")
 def ssm_manager(request, aws_creds):
-    from lib.aws.ssm_manager import SSMManager
+    from lib.aws.ssm_manager import SSMManager  # lazy -- see NOTE near top of file
     return SSMManager(
         region=request.config.getoption("--region"),
         profile=aws_creds["profile"],
@@ -548,7 +667,7 @@ def ssm_manager(request, aws_creds):
 
 @pytest.fixture(scope="session")
 def br_manager(request, ssm_manager):
-    from lib.backup_restore.br_manager import BackupRestoreManager
+    from lib.backup_restore.br_manager import BackupRestoreManager  # lazy -- see NOTE near top of file
     instance_id = request.config.getoption("--instance-id")
     ssm_manager.check_instance_online(instance_id)
     return BackupRestoreManager(ssm_manager, instance_id)
