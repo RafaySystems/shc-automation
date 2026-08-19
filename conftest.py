@@ -336,18 +336,30 @@ def ssh_client(request, raw_config, controller_profile):
             try: nsg.detach()
             except Exception as e: print(f"[ssh_client] NSG detach warning: {e}")
 
-        dns = getattr(request.session, "_dns_manager", None)
-        ip  = getattr(request.session, "_tf_public_ip", "")
-        if dns and ip:
-            try: dns.delete_record(ip)
-            except Exception as e: print(f"[ssh_client] DNS delete warning: {e}")
-
-        tf   = getattr(request.session, "_tf_manager", None)
+        # Read _keep_vm once, up front, so DNS deletion respects the SAME
+        # flag terraform destroy already did. Previously, dns.delete_record(ip)
+        # ran unconditionally regardless of --keep-vm, while only
+        # tf.destroy() below checked it -- meaning --keep-vm kept the VM
+        # alive but the Route53 record pointing a domain at it still got
+        # deleted, breaking any downstream consumer (e.g. a triggered
+        # regression run) that needs console_url/ops_console_url to keep
+        # resolving. nsg.detach() above is intentionally left unconditional
+        # -- it's a temporary security-hardening step used only around the
+        # package download (see OCINSGManager's own docstring), unrelated
+        # to whether the VM/DNS survive.
         keep = getattr(request.session, "_keep_vm", False)
-        if tf:
-            if keep:
-                print(f"[ssh_client] --keep-vm set — skipping terraform destroy")
-            else:
+
+        if keep:
+            print(f"[ssh_client] --keep-vm set — skipping DNS record delete and terraform destroy")
+        else:
+            dns = getattr(request.session, "_dns_manager", None)
+            ip  = getattr(request.session, "_tf_public_ip", "")
+            if dns and ip:
+                try: dns.delete_record(ip)
+                except Exception as e: print(f"[ssh_client] DNS delete warning: {e}")
+
+            tf = getattr(request.session, "_tf_manager", None)
+            if tf:
                 print(f"[ssh_client] Running terraform destroy ...")
                 tf.destroy()
 
