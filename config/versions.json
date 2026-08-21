@@ -40,7 +40,8 @@
             "package_url": "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/3.1/rafay-v3-airgap-controller-v3.1-37.tar.gz",
             "notes": "Oldest supported GPU-PaaS release.",
             "can_upgrade_to": ["3.1.37-2"],
-            "rctl_build": "v4.2.x-9"
+            "rctl_build": "r3.1.40-4",
+            "rauto_branch": "master"
           },
           "3.1.37-2": {
             "package_url": "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/3.1/rafay-airgapped-controller-v3.1-37-2.tar.gz",
@@ -48,33 +49,40 @@
             "can_upgrade_to": [
               "3.1.38",
               "3.1.38-2"
-            ]
+            ],
+            "rctl_build": "r3.1.40-4",
+            "rauto_branch": "master"
           },
           "3.1.38": {
             "package_url": "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/3.1/rafay-airgapped-controller-v3.1-38.tar.gz",
             "notes": "Dead-end branch -- no further hop defined from 3.1.38 yet.",
-            "can_upgrade_to": []
+            "can_upgrade_to": [],
+            "rctl_build": "r3.1.40-4",
+            "rauto_branch": "master"
           },
           "3.1.38-2": {
             "package_url": "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/3.1/rafay-airgapped-controller-v3.1-38-2.tar.gz",
             "notes": "",
             "can_upgrade_to": [
               "3.1.40-1"
-            ]
+            ],
+            "rctl_build": "r3.1.40-4",
+            "rauto_branch": "master"
           },
           "3.1.39": {
             "package_url": "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/3.1/rafay-airgapped-controller-v3.1-39.tar.gz",
             "notes": "Separate entry point -- not reachable via a hop from 3.1.37, only used as its own src_version.",
             "can_upgrade_to": [
-              "3.1.40-2"
-            ]
+              "3.1.40-2"],
+            "rctl_build": "r3.1.40-4",
+            "rauto_branch": "master"
           },
           "3.1.40-2": {
             "package_url": "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/3.1/rafay-airgapped-controller-v3.1-40-2.tar.gz",
             "notes": "Latest GPU-PaaS release. No further hop defined yet.",
             "can_upgrade_to": [],
             "rctl_build": "r3.1.40-4",
-            "rauto_branch": "v3.1.x-paas-rauto"
+            "rauto_branch": "master"
           }
         }
       }
