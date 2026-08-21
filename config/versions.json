@@ -11,25 +11,29 @@
             "package_url": "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/3.5/rafay-v3-airgap-controller-3.5-15.tar.gz",
             "notes": "Oldest supported General release.",
             "can_upgrade_to": ["3.7"],
-            "rctl_build": "v3.5.x-9"
+            "rctl_build": "v3.5.x-9",
+            "rauto_branch": "v3.5.x"
           },
           "3.7": {
             "package_url": "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/3.7/rafay-airgapped-controller-3.7-11.tar.gz",
             "notes": "",
             "can_upgrade_to": ["4.0"],
-            "rctl_build": "v3.7.x-9"
+            "rctl_build": "v3.7.x-9",
+            "rauto_branch": "v3.7.x"
           },
           "4.0": {
             "package_url": "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/4.0/rafay-airgapped-controller-4.0-6.tar.gz",
             "notes": "",
             "can_upgrade_to": ["4.0"],
-            "rctl_build": "v4.0.x-9"
+            "rctl_build": "v4.0.x-9",
+            "rauto_branch": "v3.7.x"
           },
           "4.2": {
             "package_url": "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/4.2/rafay-airgapped-controller-4.2-3.tar.gz",
             "notes": "Latest General release. No further hop defined yet.",
             "can_upgrade_to": [],
-            "rctl_build": "v4.2.x-9"
+            "rctl_build": "v4.2.x-9",
+            "rauto_branch": "v4.2.x"
           }
         }
       },
