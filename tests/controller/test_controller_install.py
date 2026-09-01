@@ -140,7 +140,15 @@ class TestPreflightChecks:
             str(required_gb) + "GB RAM -- found " + "{:.1f}".format(actual_gb) + "GB"
         )
 
-    def test_ubuntu_iptables_flushed(self, ssh_client, extras, controller_profile):
+    def test_ubuntu_iptables_flushed(self, ssh_client, extras, controller_profile, request):
+        if not request.config.getoption("--skip-bringup"):
+            pytest.skip(
+                "iptables already configured by the bringup fixture -- flushing now "
+                "would wipe kube-proxy's Service NAT rules (KUBE-SERVICES/KUBE-SVC-*) "
+                "that radm_cluster already relies on, breaking DNS/Service routing "
+                "with no self-heal since kube-proxy only rewrites rules on Service/"
+                "Endpoint changes, not on external iptables state changes"
+            )
         if controller_profile.os_type != "ubuntu24":
             pytest.skip("iptables flush check is Ubuntu 24.04 only")
 
