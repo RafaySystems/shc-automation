@@ -484,6 +484,105 @@ class TestOrgAndUser:
         request.session._test_password = password
         request.session._star_domain   = star_domain
 
+    def test_create_additional_orgs(self, request, controller_fqdn,
+                                     raw_config, extras):
+        """
+        Create 30 additional orgs post-signup, each with 20 users, reusing
+        the same POST /auth/v1/signup/organization/ endpoint as
+        test_create_org_and_user above. Called again with the same
+        organization_name and a new username each time adds another user
+        under that org rather than creating a second org -- every user in
+        every org is role=ADMIN.
+        """
+        ADDITIONAL_ORG_COUNT = 30
+        USERS_PER_ORG        = 20
+
+        star_domain, ops_url, _, console_cfg, org_cfg, partner_id = \
+            self._resolve(request, controller_fqdn, raw_config)
+
+        base_org_name = org_cfg.get("name",       "onprem-qa")
+        base_username = org_cfg.get("email",      "onprem@rafay.co")
+        password      = org_cfg.get("password",   "changeplz")
+        first_name    = org_cfg.get("first_name", "onprem")
+        last_name     = org_cfg.get("last_name",  "qa")
+        local, _, domain = base_username.partition("@")
+
+        admin_email    = console_cfg.get("email",    "admin@rafay.co")
+        admin_password = console_cfg.get("password", "change123")
+        admin_secret   = getattr(request.session, "_fresh_mfa_secret", None) \
+                          or console_cfg.get("mfa_secret") or ""
+
+        csrftoken, session = _get_authenticated_session(
+            ops_url, admin_email, admin_password, admin_secret, extras=extras
+        )
+
+        headers = {
+            "accept":          "application/json, text/plain, */*",
+            "content-type":    "application/json",
+            "x-csrftoken":     csrftoken,
+            "x-rafay-partner": partner_id,
+            "origin":          ops_url,
+            "referer":         ops_url + "/",
+        }
+
+        orgs_created, orgs_failed = [], []
+        total_users_created, total_users_failed = 0, []
+
+        for i in range(1, ADDITIONAL_ORG_COUNT + 1):
+            org_name = f"{base_org_name}-{i:02d}"
+            org_ok = True
+
+            for j in range(1, USERS_PER_ORG + 1):
+                username = f"{local}+{i:02d}-{j:02d}@{domain}"
+                role     = "ADMIN"
+
+                payload = {
+                    "username":          username,
+                    "password":          password,
+                    "organization_name": org_name,
+                    "first_name":        first_name,
+                    "last_name":         last_name,
+                    "role":              role,
+                }
+
+                print(f"[org_bulk] Org {i:02d}/{ADDITIONAL_ORG_COUNT} "
+                      f"'{org_name}' — user {j:02d}/{USERS_PER_ORG} '{username}' ({role}) ...")
+                resp = session.post(
+                    f"{ops_url}/auth/v1/signup/organization/",
+                    json=payload, headers=headers, timeout=30,
+                )
+
+                if resp.status_code == 409:
+                    print(f"[org_bulk]   already exists — continuing")
+                    total_users_created += 1
+                elif resp.status_code in (200, 201):
+                    total_users_created += 1
+                else:
+                    total_users_failed.append((org_name, username, resp.status_code, resp.text[:200]))
+                    print(f"[org_bulk]   ✗ failed ({resp.status_code}): {resp.text[:200]}")
+                    if j == 1:
+                        org_ok = False  # org's own admin user failed -- org itself never got created
+
+            (orgs_created if org_ok else orgs_failed).append(org_name)
+
+        attach_output(extras, "Orgs requested",      str(ADDITIONAL_ORG_COUNT))
+        attach_output(extras, "Orgs created",        str(len(orgs_created)))
+        attach_output(extras, "Orgs failed",         str(len(orgs_failed)))
+        attach_output(extras, "Users requested",     str(ADDITIONAL_ORG_COUNT * USERS_PER_ORG))
+        attach_output(extras, "Users created",       str(total_users_created))
+        attach_output(extras, "Users failed",        str(len(total_users_failed)))
+        if total_users_failed:
+            attach_output(
+                extras, "User creation failures",
+                "\n".join(f"{org}/{user}: {code} — {text}"
+                          for org, user, code, text in total_users_failed[:20])
+            )
+
+        assert not total_users_failed, (
+            f"{len(total_users_failed)}/{ADDITIONAL_ORG_COUNT * USERS_PER_ORG} "
+            f"user creations failed across {len(orgs_failed)} org(s): {total_users_failed[:3]}"
+        )
+
     def test_prelogin_check(self, request, controller_fqdn,
                              raw_config, extras):
         """POST /auth/v1/prelogin/ — verify user exists in system."""
