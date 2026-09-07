@@ -135,6 +135,19 @@ class ConsoleLogin:
         mfa_type = self._detect_mfa_page(page)
         print(f"[console_login] MFA type: {mfa_type}")
 
+        # Capture the MFA page unconditionally, before we know whether this
+        # run succeeds or fails, and before we know whether it's a real
+        # enrollment/QR page or just the plain OTP box (saved-secret case).
+        # Previously self._qr_bytes was only ever set inside _scan_qr(),
+        # which only runs on the enrollment paths below -- so on a normal
+        # success run with an already-known secret (no re-enrollment needed)
+        # nothing was ever captured, and the report only ever showed a QR
+        # image on the runs that happened to force re-enrollment. If
+        # _scan_qr() does run further down, it overwrites this with the
+        # tighter canvas-only crop, which is the more useful image when an
+        # actual QR is present.
+        self._capture_mfa_page(page)
+
         secret = self.mfa_secret
 
         if mfa_type == "enrollment" and not secret:
@@ -289,6 +302,20 @@ class ConsoleLogin:
         if has_verify:
             return "otp"
         return "unknown"
+
+    def _capture_mfa_page(self, page):
+        """
+        Screenshot whatever the MFA step currently looks like -- the QR
+        enrollment canvas on a first-time/re-enrollment page, or just the
+        6-digit OTP box on a normal login with a saved secret. Called
+        unconditionally, before any OTP is submitted, so it lands in the
+        report on both success and failure, not only when _scan_qr() below
+        happens to run.
+        """
+        try:
+            self._qr_bytes = page.screenshot(full_page=False)
+        except Exception as e:
+            print(f"[console_login] Could not capture MFA page screenshot: {e}")
 
     def _scan_qr(self, page) -> str:
         """Extract TOTP secret from QR canvas."""
