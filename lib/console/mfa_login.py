@@ -140,19 +140,6 @@ class ConsoleLogin:
         print(f"[console_login] MFA type: {mfa_type}")
         self._mfa_type = mfa_type
 
-        # Capture the MFA page unconditionally, before we know whether this
-        # run succeeds or fails, and before we know whether it's a real
-        # enrollment/QR page or just the plain OTP box (saved-secret case).
-        # Previously self._qr_bytes was only ever set inside _scan_qr(),
-        # which only runs on the enrollment paths below -- so on a normal
-        # success run with an already-known secret (no re-enrollment needed)
-        # nothing was ever captured, and the report only ever showed a QR
-        # image on the runs that happened to force re-enrollment. If
-        # _scan_qr() does run further down, it overwrites this with the
-        # tighter canvas-only crop, which is the more useful image when an
-        # actual QR is present.
-        self._capture_mfa_page(page)
-
         secret = self.mfa_secret
 
         if mfa_type == "enrollment" and not secret:
@@ -308,22 +295,11 @@ class ConsoleLogin:
             return "otp"
         return "unknown"
 
-    def _capture_mfa_page(self, page):
-        """
-        Screenshot whatever the MFA step currently looks like -- the QR
-        enrollment canvas on a first-time/re-enrollment page, or just the
-        6-digit OTP box on a normal login with a saved secret. Called
-        unconditionally, before any OTP is submitted, so it lands in the
-        report on both success and failure, not only when _scan_qr() below
-        happens to run.
-        """
-        try:
-            self._qr_bytes = page.screenshot(full_page=False)
-        except Exception as e:
-            print(f"[console_login] Could not capture MFA page screenshot: {e}")
-
     def _scan_qr(self, page) -> str:
-        """Extract TOTP secret from QR canvas."""
+        """Extract TOTP secret from QR canvas, and keep the raw QR image
+        itself so it can be attached to the report -- only called on the
+        enrollment branch, so self._qr_bytes here is always a real QR,
+        never a plain OTP box."""
         try:
             from pyzbar.pyzbar import decode
             from PIL import Image
@@ -342,9 +318,9 @@ class ConsoleLogin:
         if not b64_data:
             raise ValueError("Canvas found but toDataURL returned nothing")
 
-        # Save the raw QR image itself (the canvas IS the QR code — no need
-        # for a broader page screenshot) so it can be attached to the report
-        # regardless of whether decoding/login succeeds afterward.
+        # Save the raw QR image itself (the canvas IS the QR code) so it
+        # can be attached to the report regardless of whether decoding or
+        # login succeeds afterward.
         self._qr_bytes = base64.b64decode(b64_data)
 
         image   = Image.open(io.BytesIO(self._qr_bytes))

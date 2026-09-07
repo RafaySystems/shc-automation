@@ -101,21 +101,18 @@ def attach_screenshot(extras, label: str, screenshot_bytes: bytes):
         print(f"[attach_screenshot] Allure attach failed: {e}")
 
 
-def _mfa_screenshot_label(result, suffix: str = "") -> str:
+def _attach_qr_and_secret(extras, result, suffix: str = ""):
     """
-    Label the attached MFA screenshot by what was actually captured --
-    result.mfa_type tells us whether the page shown was a real QR
-    enrollment screen or just the plain 6-digit OTP box (saved-secret
-    case), so the report doesn't call an OTP screenshot a "QR code".
+    Attach the QR code image only when a real one was shown (mfa_type ==
+    "enrollment") -- result.qr_screenshot is only ever populated on that
+    branch (see _scan_qr() in mfa_login.py), so this never mislabels a
+    plain OTP box as a QR code. The TOTP secret is attached every time,
+    since it's needed whether or not this run happened to show the QR.
     """
-    mfa_type = getattr(result, "mfa_type", "")
-    if mfa_type == "enrollment":
-        label = "MFA enrollment (QR) screen"
-    elif mfa_type == "otp":
-        label = "MFA OTP screen"
-    else:
-        label = "MFA screen"
-    return f"{label}{suffix}"
+    if getattr(result, "mfa_type", "") == "enrollment" and getattr(result, "qr_screenshot", b""):
+        attach_screenshot(extras, f"QR code{suffix}", result.qr_screenshot)
+    if getattr(result, "secret", ""):
+        attach_output(extras, f"TOTP secret{suffix}", result.secret)
 
 
 def _save_secret_to_config(env: str, secret: str):
@@ -225,14 +222,7 @@ def _get_authenticated_session(ops_url: str, email: str,
     result  = console.login()
 
     if extras is not None:
-        if getattr(result, "qr_screenshot", b""):
-            attach_screenshot(
-                extras,
-                _mfa_screenshot_label(result, suffix=" (admin session)"),
-                result.qr_screenshot,
-            )
-        if getattr(result, "secret", ""):
-            attach_output(extras, "TOTP secret (admin session)", result.secret)
+        _attach_qr_and_secret(extras, result, suffix=" (admin session)")
 
     if not result.success:
         raise RuntimeError(f"Admin login failed: {result.error}")
@@ -362,11 +352,7 @@ class TestConsoleLogin:
         if result.screenshot:
             attach_screenshot(extras, "ops-console dashboard screenshot", result.screenshot)
 
-        if getattr(result, "qr_screenshot", b""):
-            attach_screenshot(extras, _mfa_screenshot_label(result), result.qr_screenshot)
-
-        if getattr(result, "secret", ""):
-            attach_output(extras, "TOTP secret", result.secret)
+        _attach_qr_and_secret(extras, result)
 
         if result.success and result.secret and result.secret != mfa_secret:
             _save_secret_to_config(
