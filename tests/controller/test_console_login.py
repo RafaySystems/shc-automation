@@ -101,6 +101,23 @@ def attach_screenshot(extras, label: str, screenshot_bytes: bytes):
         print(f"[attach_screenshot] Allure attach failed: {e}")
 
 
+def _mfa_screenshot_label(result, suffix: str = "") -> str:
+    """
+    Label the attached MFA screenshot by what was actually captured --
+    result.mfa_type tells us whether the page shown was a real QR
+    enrollment screen or just the plain 6-digit OTP box (saved-secret
+    case), so the report doesn't call an OTP screenshot a "QR code".
+    """
+    mfa_type = getattr(result, "mfa_type", "")
+    if mfa_type == "enrollment":
+        label = "MFA enrollment (QR) screen"
+    elif mfa_type == "otp":
+        label = "MFA OTP screen"
+    else:
+        label = "MFA screen"
+    return f"{label}{suffix}"
+
+
 def _save_secret_to_config(env: str, secret: str):
     """Save TOTP secret to dev.yaml after first QR scan."""
     config_path = Path(__file__).parent.parent.parent / "config" / f"{env}.yaml"
@@ -209,7 +226,11 @@ def _get_authenticated_session(ops_url: str, email: str,
 
     if extras is not None:
         if getattr(result, "qr_screenshot", b""):
-            attach_screenshot(extras, "TOTP enrollment QR code (admin session)", result.qr_screenshot)
+            attach_screenshot(
+                extras,
+                _mfa_screenshot_label(result, suffix=" (admin session)"),
+                result.qr_screenshot,
+            )
         if getattr(result, "secret", ""):
             attach_output(extras, "TOTP secret (admin session)", result.secret)
 
@@ -342,7 +363,7 @@ class TestConsoleLogin:
             attach_screenshot(extras, "ops-console dashboard screenshot", result.screenshot)
 
         if getattr(result, "qr_screenshot", b""):
-            attach_screenshot(extras, "TOTP enrollment QR code", result.qr_screenshot)
+            attach_screenshot(extras, _mfa_screenshot_label(result), result.qr_screenshot)
 
         if getattr(result, "secret", ""):
             attach_output(extras, "TOTP secret", result.secret)

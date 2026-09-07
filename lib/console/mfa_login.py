@@ -23,6 +23,7 @@ class LoginResult:
     dashboard:    dict = field(default_factory=dict)
     error:        str = ""
     qr_screenshot: bytes = b""
+    mfa_type:     str = ""
 
 
 class ConsoleLogin:
@@ -39,6 +40,7 @@ class ConsoleLogin:
         self.password   = password
         self.mfa_secret = mfa_secret
         self._qr_bytes  = b""
+        self._mfa_type  = ""
 
     def login(self) -> LoginResult:
         try:
@@ -71,6 +73,7 @@ class ConsoleLogin:
                     screenshot=screenshot,
                     dashboard=dashboard,
                     qr_screenshot=self._qr_bytes,
+                    mfa_type=self._mfa_type,
                 )
             except Exception as e:
                 screenshot = page.screenshot(full_page=False)
@@ -81,6 +84,7 @@ class ConsoleLogin:
                     screenshot=screenshot,
                     error=str(e),
                     qr_screenshot=self._qr_bytes,
+                    mfa_type=self._mfa_type,
                 )
             finally:
                 browser.close()
@@ -134,6 +138,7 @@ class ConsoleLogin:
 
         mfa_type = self._detect_mfa_page(page)
         print(f"[console_login] MFA type: {mfa_type}")
+        self._mfa_type = mfa_type
 
         # Capture the MFA page unconditionally, before we know whether this
         # run succeeds or fails, and before we know whether it's a real
