@@ -383,9 +383,11 @@ class TestOrgAndUser:
     Create org + user via signup API, then verify login and capture screenshot.
 
     Flow:
-      1. test_create_org_and_user → POST /auth/v1/signup/organization/
-      2. test_prelogin_check      → POST /auth/v1/prelogin/
-      3. test_user_login          → POST /auth/v1/login/ + browser screenshot
+      1. test_create_org_and_user       → POST /auth/v1/signup/organization/
+      2. test_prelogin_check            → POST /auth/v1/prelogin/
+      3. test_user_login                → POST /auth/v1/login/ + browser screenshot
+      4. test_load_skus (--load-skus)   → set default org, mint API key,
+                                           SSH download/patch/run SKU loader
     """
 
     @pytest.fixture(autouse=True)
@@ -564,3 +566,175 @@ class TestOrgAndUser:
             attach_output(extras, "console dashboard URL", dashboard_url)
         else:
             print(f"[org_user] No screenshot captured")
+
+    @pytest.mark.sku_load
+    def test_load_skus(self, request, controller_fqdn, raw_config, ssh_client, extras):
+        """
+        Load SKUs onto the controller after signup/login has succeeded.
+        Skipped by default -- only runs with --load-skus (see conftest.py's
+        pytest_collection_modifyitems).
+
+        Flow:
+          1. Look up onprem-qa's org id, then POST /v2/sentry/defaultorg
+             (body: {"organization_id": <id>}) to actually make it the
+             default org -- confirmed real endpoint, not an assumption.
+          2. GET /auth/v1/users/-/current/ for the logged-in admin's own
+             account.id -- this is what accountroles/{id}/apikey/ actually
+             keys on, NOT an org id (confirmed by comparing against a real
+             capture -- an org id from the same partner coincidentally
+             looked plausible here, which is exactly the trap this avoids).
+          3. POST that account's apikey/ endpoint (body: {"name": "dynamic"})
+             to mint a fresh API key.
+          4. SSH to the controller: download+extract sku_tarball_url,
+             patch its config.yaml, run loader-utility.py.
+
+        ASSUMPTION (flagged, not confirmed): the apikey/ POST response's
+        key field name -- checks a few plausible names since we only have
+        the UI-rendered value, not the raw JSON shape.
+        """
+        sku_tarball_url = request.config.getoption("--sku-tarball-url")
+        if not sku_tarball_url:
+            pytest.skip("--load-skus is set but --sku-tarball-url is empty -- nothing to load")
+
+        star_domain, ops_url, console_url, console_cfg, org_cfg, partner_id = \
+            self._resolve(request, controller_fqdn, raw_config)
+
+        org_name = org_cfg.get("name", "onprem-qa")
+
+        admin_email    = console_cfg.get("email",    "admin@rafay.co")
+        admin_password = console_cfg.get("password", "change123")
+        admin_secret   = getattr(request.session, "_fresh_mfa_secret", None) \
+                          or console_cfg.get("mfa_secret") or ""
+
+        csrftoken, session = _get_authenticated_session(
+            ops_url, admin_email, admin_password, admin_secret, extras=extras
+        )
+        headers = {
+            "accept":          "application/json, text/plain, */*",
+            "content-type":    "application/json",
+            "x-csrftoken":     csrftoken,
+            "x-rafay-partner": partner_id,
+            "origin":          ops_url,
+            "referer":         ops_url + "/",
+        }
+
+        # ── Step 1: make onprem-qa the default org (real action) ───────────
+        print(f"[sku_load] Looking up org id for '{org_name}' ...")
+        orgs_resp = session.get(
+            f"{ops_url}/auth/v1/organizations/",
+            params={"limit": 10, "offset": 0, "partner_id": partner_id},
+            headers=headers, timeout=15,
+        )
+        attach_output(extras, "Organizations list status", str(orgs_resp.status_code))
+        assert orgs_resp.status_code == 200, \
+            f"Organizations list failed ({orgs_resp.status_code}): {orgs_resp.text[:300]}"
+
+        org_entry = next(
+            (o for o in orgs_resp.json().get("results", []) if o.get("name") == org_name),
+            None
+        )
+        assert org_entry, f"Org '{org_name}' not found in organizations list: {orgs_resp.text[:500]}"
+        org_id = org_entry["id"]
+        attach_output(extras, "Org ID", org_id)
+
+        print(f"[sku_load] Setting '{org_name}' ({org_id}) as default org ...")
+        default_resp = session.post(
+            f"{ops_url}/v2/sentry/defaultorg",
+            json={"organization_id": org_id}, headers=headers, timeout=15,
+        )
+        attach_output(extras, "Set-default-org status", str(default_resp.status_code))
+        attach_output(extras, "Set-default-org response", default_resp.text[:500])
+        assert default_resp.status_code == 200, (
+            f"Set default org failed ({default_resp.status_code}): {default_resp.text[:300]}"
+        )
+        assert default_resp.json().get("success") is True, (
+            f"Set default org returned success=false: {default_resp.text[:500]}"
+        )
+        print(f"[sku_load] ✓ '{org_name}' set as default org")
+
+        # ── Step 2: resolve the admin's own account id ─────────────────────
+        current_resp = session.get(
+            f"{ops_url}/auth/v1/users/-/current/", headers=headers, timeout=15,
+        )
+        attach_output(extras, "Current user status", str(current_resp.status_code))
+        assert current_resp.status_code == 200, \
+            f"GET current user failed ({current_resp.status_code}): {current_resp.text[:300]}"
+        account_id = current_resp.json().get("account", {}).get("id", "")
+        assert account_id, f"No account.id in current-user response: {current_resp.text[:500]}"
+        attach_output(extras, "Admin account ID", account_id)
+        print(f"[sku_load] Admin account ID: {account_id}")
+
+        # ── Step 3: mint a fresh API key ────────────────────────────────────
+        print(f"[sku_load] Creating API key for account {account_id} ...")
+        apikey_resp = session.post(
+            f"{ops_url}/auth/v1/accountroles/{account_id}/apikey/",
+            json={"name": "dynamic"}, headers=headers, timeout=15,
+        )
+        attach_output(extras, "API key creation status", str(apikey_resp.status_code))
+        assert apikey_resp.status_code in (200, 201), \
+            f"API key creation failed ({apikey_resp.status_code}): {apikey_resp.text[:300]}"
+
+        apikey_json = apikey_resp.json()
+        api_key = (
+            apikey_json.get("key") or apikey_json.get("apiKey")
+            or apikey_json.get("api_key") or apikey_json.get("apikey") or ""
+        )
+        assert api_key, (
+            f"Could not find the API key under any expected field name "
+            f"(key/apiKey/api_key/apikey) in response: {apikey_json}"
+        )
+        # Never attach the real key value to the report -- it's a live
+        # credential, same handling as any other secret in this framework.
+        attach_output(extras, "API key created", f"(captured, {len(api_key)} chars, not shown)")
+        print(f"[sku_load] ✓ API key created ({len(api_key)} chars)")
+
+        # ── Step 4: download, patch config.yaml, run the loader ─────────────
+        console_fqdn = f"console.{star_domain}"
+        ops_fqdn     = f"ops-console.{star_domain}"
+
+        tarball_name = sku_tarball_url.rsplit("/", 1)[-1]
+        extract_dir  = tarball_name.replace(".tar.gz", "")
+        work_dir     = "sky"
+
+        print(f"[sku_load] Downloading {sku_tarball_url} on controller ...")
+        out, rc = ssh_client.run(
+            f"mkdir -p {work_dir} && cd {work_dir} && "
+            f"wget -q '{sku_tarball_url}' && tar -xf {tarball_name}",
+            timeout=300,
+        )
+        attach_output(extras, "Download+extract output", out[-1000:])
+        assert rc == 0, f"Download/extract failed (exit {rc}): {out[-500:]}"
+
+        config_path = f"{work_dir}/{extract_dir}/config.yaml"
+        print(f"[sku_load] Patching {config_path} ...")
+        # sed, not a YAML-parsing script -- avoids depending on PyYAML being
+        # installed on the controller VM itself (not guaranteed present),
+        # same reasoning as the plain-string patch commands used elsewhere
+        # in this framework for config.yaml edits.
+        patch_cmd = (
+            f"cd {work_dir}/{extract_dir} && "
+            f"sed -i 's|^hostenv:.*|hostenv: {console_fqdn}|' config.yaml && "
+            f"sed -i 's|^opsenv:.*|opsenv: {ops_fqdn}|' config.yaml && "
+            f"sed -i 's|^apikey:.*|apikey: {api_key}|' config.yaml && "
+            f"sed -i 's|^projectname:.*|projectname: system-catalog|' config.yaml && "
+            f"sed -i 's|^host_cluster_name:.*|host_cluster_name: null|' config.yaml && "
+            f"sed -i 's|^kubeconfig_file:.*|kubeconfig_file: null|' config.yaml && "
+            f"sed -i 's|^hostname_suffix:.*|hostname_suffix: null|' config.yaml"
+        )
+        out, rc = ssh_client.run(patch_cmd, timeout=30)
+        attach_output(extras, "config.yaml patch output", out[-500:] or "(no output)")
+        assert rc == 0, f"config.yaml patch failed (exit {rc}): {out[-500:]}"
+        print(f"[sku_load] ✓ config.yaml patched")
+
+        print(f"[sku_load] Running loader-utility.py ...")
+        out, rc = ssh_client.run_stream(
+            f"cd {work_dir}/{extract_dir} && python3 loader-utility.py",
+            timeout=1800, prefix="[loader-utility]",
+        )
+        attach_output(extras, "loader-utility.py output", out[-4000:])
+        assert rc == 0, f"loader-utility.py failed (exit {rc}) -- see attached output for details"
+        assert "Completed loading templates for org" in out, (
+            "loader-utility.py exited 0 but its completion line never appeared in output -- "
+            "treating as a failure rather than trusting the exit code alone."
+        )
+        print(f"[sku_load] ✓ SKU loading completed")

@@ -116,6 +116,22 @@ def pytest_addoption(parser):
                      help="Issue a Let's Encrypt wildcard cert via Route53 DNS-01 "
                           "instead of the controller's self-signed default")
 
+    # ── SKU loading -- runs in the SAME pytest session, right after
+    # signup/login succeeds. Same on/off-switch pattern as
+    # --run-backup-restore above: test is marked @pytest.mark.sku_load and
+    # skipped by default (see pytest_collection_modifyitems below).
+    # --sku-tarball-url is deliberately checked TWICE (once in
+    # Rauto.jenkinsfile before this flag is even passed, again here) --
+    # belt and suspenders against a stale/leftover value ever silently
+    # triggering a load when --load-skus wasn't actually set, whether
+    # that's from a Jenkins parameter carrying forward or a direct pytest
+    # invocation that passes --sku-tarball-url without --load-skus.
+    parser.addoption("--load-skus",       action="store_true", default=False,
+                     help="Load SKUs onto the controller after signup/login succeeds (marked sku_load)")
+    parser.addoption("--sku-tarball-url", default=None,
+                     help="Full URL to the version-specific ncp-templates tarball. "
+                          "Only read when --load-skus is also set.")
+
 
 def pytest_collection_modifyitems(config, items):
     """
@@ -131,12 +147,23 @@ def pytest_collection_modifyitems(config, items):
     only when a selected test actually requests them, so a skipped
     backup_restore test never triggers that import at all.
     """
-    if config.getoption("--run-backup-restore"):
-        return
-    skip_br = pytest.mark.skip(reason="need --run-backup-restore to run backup-restore tests")
-    for item in items:
-        if "backup_restore" in item.keywords:
-            item.add_marker(skip_br)
+    if not config.getoption("--run-backup-restore"):
+        skip_br = pytest.mark.skip(reason="need --run-backup-restore to run backup-restore tests")
+        for item in items:
+            if "backup_restore" in item.keywords:
+                item.add_marker(skip_br)
+
+    # SKU loading -- same pattern, separate flag. Deliberately a second,
+    # independent if-block (not sharing the early-return the original
+    # backup_restore-only version of this function used) so backup-restore
+    # and SKU loading can each be toggled without affecting the other --
+    # an early return here would have skipped this entire block whenever
+    # --run-backup-restore was set, regardless of --load-skus.
+    if not config.getoption("--load-skus"):
+        skip_sku = pytest.mark.skip(reason="need --load-skus to run SKU loading")
+        for item in items:
+            if "sku_load" in item.keywords:
+                item.add_marker(skip_sku)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -264,7 +291,7 @@ def ssh_client(request, raw_config, controller_profile):
         from lib.oci.vm_manager import load_oci_profile, OCINSGManager
         from lib.terraform.tf_manager import TerraformManager
 
-        oci_profile = load_oci_profile(raw_config)
+        oci_profile = load_oci_profile(raw_config, os_type=controller_profile.os_type)
         dns_cfg     = raw_config.get("dns", {})
         tf_manager  = TerraformManager(oci_profile)
         build_no    = request.config.getoption("--build-no") or os.environ.get("BUILD_NUMBER")
@@ -378,7 +405,7 @@ def secondary_ips(request, raw_config):
 
 
 @pytest.fixture(scope="session")
-def secondary_instance_ids(request, raw_config):
+def secondary_instance_ids(request, raw_config, controller_profile):
     cli_ids = request.config.getoption("--secondary-ids", default=None)
     if cli_ids:
         return [i.strip() for i in cli_ids.split(",") if i.strip()]
@@ -397,7 +424,7 @@ def secondary_instance_ids(request, raw_config):
         try:
             from lib.oci.vm_manager import load_oci_profile
             from lib.terraform.tf_manager import TerraformManager
-            oci_profile = load_oci_profile(raw_config)
+            oci_profile = load_oci_profile(raw_config, os_type=controller_profile.os_type)
             tf_manager  = TerraformManager(oci_profile)
             all_ids, _, _ = tf_manager.read_state()
             if len(all_ids) > 1:
@@ -410,16 +437,16 @@ def secondary_instance_ids(request, raw_config):
 
 
 @pytest.fixture(scope="session")
-def oci_profile_fixture(request, raw_config):
+def oci_profile_fixture(request, raw_config, controller_profile):
     from lib.oci.vm_manager import load_oci_profile
     try:
-        return load_oci_profile(raw_config)
+        return load_oci_profile(raw_config, os_type=controller_profile.os_type)
     except Exception:
         return None
 
 
 @pytest.fixture(scope="session")
-def nsg_manager(request, raw_config):
+def nsg_manager(request, raw_config, controller_profile):
     instance_id = getattr(request.session, "_tf_instance_id", None)
     if not instance_id:
         instance_id = request.config.getoption("--controller-instance-id", default=None)
@@ -429,7 +456,7 @@ def nsg_manager(request, raw_config):
     if instance_id and raw_config.get("oci", {}).get("nsg_id"):
         from lib.oci.vm_manager import OCINSGManager, load_oci_profile
         try:
-            oci_profile = load_oci_profile(raw_config)
+            oci_profile = load_oci_profile(raw_config, os_type=controller_profile.os_type)
             mgr = OCINSGManager(oci_profile, instance_id)
             request.session._nsg_manager = mgr
             yield mgr
