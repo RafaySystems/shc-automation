@@ -291,7 +291,7 @@ def ssh_client(request, raw_config, controller_profile):
         from lib.oci.vm_manager import load_oci_profile, OCINSGManager
         from lib.terraform.tf_manager import TerraformManager
 
-        oci_profile = load_oci_profile(raw_config, os_type=controller_profile.os_type)
+        oci_profile = load_oci_profile(raw_config)
         dns_cfg     = raw_config.get("dns", {})
         tf_manager  = TerraformManager(oci_profile)
         build_no    = request.config.getoption("--build-no") or os.environ.get("BUILD_NUMBER")
@@ -405,7 +405,7 @@ def secondary_ips(request, raw_config):
 
 
 @pytest.fixture(scope="session")
-def secondary_instance_ids(request, raw_config, controller_profile):
+def secondary_instance_ids(request, raw_config):
     cli_ids = request.config.getoption("--secondary-ids", default=None)
     if cli_ids:
         return [i.strip() for i in cli_ids.split(",") if i.strip()]
@@ -424,7 +424,7 @@ def secondary_instance_ids(request, raw_config, controller_profile):
         try:
             from lib.oci.vm_manager import load_oci_profile
             from lib.terraform.tf_manager import TerraformManager
-            oci_profile = load_oci_profile(raw_config, os_type=controller_profile.os_type)
+            oci_profile = load_oci_profile(raw_config)
             tf_manager  = TerraformManager(oci_profile)
             all_ids, _, _ = tf_manager.read_state()
             if len(all_ids) > 1:
@@ -437,16 +437,16 @@ def secondary_instance_ids(request, raw_config, controller_profile):
 
 
 @pytest.fixture(scope="session")
-def oci_profile_fixture(request, raw_config, controller_profile):
+def oci_profile_fixture(request, raw_config):
     from lib.oci.vm_manager import load_oci_profile
     try:
-        return load_oci_profile(raw_config, os_type=controller_profile.os_type)
+        return load_oci_profile(raw_config)
     except Exception:
         return None
 
 
 @pytest.fixture(scope="session")
-def nsg_manager(request, raw_config, controller_profile):
+def nsg_manager(request, raw_config):
     instance_id = getattr(request.session, "_tf_instance_id", None)
     if not instance_id:
         instance_id = request.config.getoption("--controller-instance-id", default=None)
@@ -456,7 +456,7 @@ def nsg_manager(request, raw_config, controller_profile):
     if instance_id and raw_config.get("oci", {}).get("nsg_id"):
         from lib.oci.vm_manager import OCINSGManager, load_oci_profile
         try:
-            oci_profile = load_oci_profile(raw_config, os_type=controller_profile.os_type)
+            oci_profile = load_oci_profile(raw_config)
             mgr = OCINSGManager(oci_profile, instance_id)
             request.session._nsg_manager = mgr
             yield mgr
