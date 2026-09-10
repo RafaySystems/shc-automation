@@ -568,7 +568,7 @@ class TestOrgAndUser:
             print(f"[org_user] No screenshot captured")
 
     @pytest.mark.sku_load
-    def test_load_skus(self, request, controller_fqdn, raw_config, ssh_client, extras):
+    def test_load_skus(self, request, controller_fqdn, raw_config, ssh_client, nsg_manager, extras):
         """
         Load SKUs onto the controller after signup/login has succeeded.
         Skipped by default -- only runs with --load-skus (see conftest.py's
@@ -696,12 +696,34 @@ class TestOrgAndUser:
         extract_dir  = tarball_name.replace(".tar.gz", "")
         work_dir     = "sky"
 
-        print(f"[sku_load] Downloading {sku_tarball_url} on controller ...")
-        out, rc = ssh_client.run(
-            f"mkdir -p {work_dir} && cd {work_dir} && "
-            f"wget -q '{sku_tarball_url}' && tar -xf {tarball_name}",
-            timeout=300,
-        )
+        # NSG attach is what actually grants internet egress here -- the
+        # subnet's own security list is airgapped by default (no broad
+        # 0.0.0.0/0 rule at that level), same as bringup's own package
+        # download uses OCINSGManager for. Attach right before the only
+        # step here that needs internet, detach in `finally` so the node
+        # goes back to airgapped regardless of whether the download
+        # itself succeeds -- mirrors OCINSGManager's own attach/detach
+        # docstring pattern exactly. nsg_manager can be None (e.g. no
+        # oci.nsg_id configured) -- guarded, not assumed present.
+        if nsg_manager:
+            print(f"[sku_load] Attaching NSG for tarball download ...")
+            nsg_manager.attach()
+
+        try:
+            print(f"[sku_load] Downloading {sku_tarball_url} on controller ...")
+            out, rc = ssh_client.run(
+                f"mkdir -p {work_dir} && cd {work_dir} && "
+                f"wget -q '{sku_tarball_url}' && tar -xf {tarball_name}",
+                timeout=300,
+            )
+        finally:
+            if nsg_manager:
+                print(f"[sku_load] Detaching NSG -- restoring airgapped state ...")
+                try:
+                    nsg_manager.detach()
+                except Exception as e:
+                    print(f"[sku_load] NSG detach warning: {e}")
+
         attach_output(extras, "Download+extract output", out[-1000:])
         assert rc == 0, f"Download/extract failed (exit {rc}): {out[-500:]}"
 
