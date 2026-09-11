@@ -38,6 +38,11 @@ class OCIProfile:
     tags: dict = field(default_factory=dict)
     boot_timeout: int = 300
     ha: bool = False               # HA mode — 3 nodes when True
+    extra_ssh_public_key_b64: Optional[str] = None  # additive, user-uploaded (Jenkins custom_ssh_public_key param)
+
+    @property
+    def is_custom_ssh_key(self) -> bool:
+        return bool(self.extra_ssh_public_key_b64)
 
     def __post_init__(self):
         # os.path.expandvars resolves ${RAUTO_OCI_SSH_PUBLIC_KEY}-style
@@ -89,7 +94,8 @@ class OCIProfile:
             )
 
 
-def load_oci_profile(cfg: dict, build_no: Optional[str] = None) -> OCIProfile:
+def load_oci_profile(cfg: dict, build_no: Optional[str] = None,
+                      extra_ssh_public_key_b64: Optional[str] = None) -> OCIProfile:
     """Build OCIProfile from dev.yaml. Env vars override YAML values."""
     oci_cfg = cfg.get("oci", {})
 
@@ -138,6 +144,7 @@ def load_oci_profile(cfg: dict, build_no: Optional[str] = None) -> OCIProfile:
         ha=resolved_ha,
         tags=oci_cfg.get("tags") or {},
         boot_timeout=int(resolve(oci_cfg.get("boot_timeout", 300), "OCI_BOOT_TIMEOUT")),
+        extra_ssh_public_key_b64=extra_ssh_public_key_b64,
     )
 
 
@@ -259,6 +266,19 @@ class OCIVMManager:
         content = key_path.read_text().strip()
         if not content.startswith("ssh-"):
             raise ValueError(f"File at {key_path} does not look like an SSH public key.")
+
+        # Additive: the default automation key is always authorized (needed
+        # for radm/tests to SSH in regardless of what else is uploaded) --
+        # a user-supplied custom key, when present, is appended alongside it,
+        # never in place of it. See Rauto.jenkinsfile custom_ssh_public_key
+        # param design note.
+        if self.profile.extra_ssh_public_key_b64:
+            import base64
+            extra_key = base64.b64decode(self.profile.extra_ssh_public_key_b64).decode().strip()
+            if not extra_key.startswith("ssh-"):
+                raise ValueError("Decoded extra_ssh_public_key_b64 does not look like an SSH public key.")
+            content = f"{content}\n{extra_key}"
+
         return content
 
     def _wait_for_running(self, instance_id: str) -> str:

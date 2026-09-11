@@ -37,6 +37,23 @@ def decode_commands(b64_str: str) -> list:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
+# Populated as tests run (test_create_org_and_user, _attach_qr_and_secret,
+# wherever OCIProfile/build info is available) and printed once, at the very
+# end of console output, by pytest_terminal_summary below. Single conftest.py
+# in this repo -- other test files can safely `from conftest import
+# CONTROLLER_SUMMARY` without the multi-conftest import-identity risk that
+# would otherwise apply.
+CONTROLLER_SUMMARY = {}
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    if not CONTROLLER_SUMMARY:
+        return
+    terminalreporter.write_sep("=", "Controller Info")
+    for key, value in CONTROLLER_SUMMARY.items():
+        terminalreporter.write_line(f"{key:20s}: {value}")
+
+
 def pytest_addoption(parser):
     parser.addoption("--env",             default="dev",  help="Config env: dev | staging")
     parser.addoption("--controller-ip",   default=None,   help="Override controller IP (skips provisioning)")
@@ -50,6 +67,8 @@ def pytest_addoption(parser):
     parser.addoption("--build-no",        default=None,   help="Build number -> VM display name e.g. 42")
     parser.addoption("--keep-vm",         action="store_true", default=False,
                      help="Skip terraform destroy after session")
+    parser.addoption("--extra-ssh-public-key-b64", default=None,
+                     help="Base64-encoded additional SSH public key to authorize on the new controller VM(s), alongside the default automation key")
 
     # ── Bringup package -- URL only, no name-based derivation ────────────────
     # UPDATED per team design review (2026-07-22): --package-name and the
@@ -291,7 +310,10 @@ def ssh_client(request, raw_config, controller_profile):
         from lib.oci.vm_manager import load_oci_profile, OCINSGManager
         from lib.terraform.tf_manager import TerraformManager
 
-        oci_profile = load_oci_profile(raw_config)
+        oci_profile = load_oci_profile(
+            raw_config,
+            extra_ssh_public_key_b64=request.config.getoption("--extra-ssh-public-key-b64"),
+        )
         dns_cfg     = raw_config.get("dns", {})
         tf_manager  = TerraformManager(oci_profile)
         build_no    = request.config.getoption("--build-no") or os.environ.get("BUILD_NUMBER")
@@ -440,7 +462,10 @@ def secondary_instance_ids(request, raw_config):
 def oci_profile_fixture(request, raw_config):
     from lib.oci.vm_manager import load_oci_profile
     try:
-        return load_oci_profile(raw_config)
+        return load_oci_profile(
+            raw_config,
+            extra_ssh_public_key_b64=request.config.getoption("--extra-ssh-public-key-b64"),
+        )
     except Exception:
         return None
 

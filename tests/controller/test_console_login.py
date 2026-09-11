@@ -22,12 +22,15 @@ Run standalone:
         --html=report.html --self-contained-html -s
 """
 
+import os
 import re
 import time
 import pytest
 import yaml
 import requests
 from pathlib import Path
+
+from conftest import CONTROLLER_SUMMARY
 
 pytestmark = [pytest.mark.order(2), pytest.mark.controller, pytest.mark.console]
 
@@ -101,7 +104,7 @@ def attach_screenshot(extras, label: str, screenshot_bytes: bytes):
         print(f"[attach_screenshot] Allure attach failed: {e}")
 
 
-def _attach_qr_and_secret(extras, result, suffix: str = ""):
+def _attach_qr_and_secret(extras, result, suffix: str = "", request=None):
     """
     Attach the QR code image only when a real one was shown (mfa_type ==
     "enrollment") -- result.qr_screenshot is only ever populated on that
@@ -111,6 +114,32 @@ def _attach_qr_and_secret(extras, result, suffix: str = ""):
     """
     if getattr(result, "mfa_type", "") == "enrollment" and getattr(result, "qr_screenshot", b""):
         attach_screenshot(extras, f"QR code{suffix}", result.qr_screenshot)
+
+        # Persist alongside junit.xml/allure output so it rides along with
+        # the existing `archiveArtifacts artifacts: 'shc-automation/reports/**'`
+        # in Rauto.jenkinsfile -- no Jenkinsfile change needed. Derive the
+        # reports dir from --junitxml (same one the Jenkinsfile already
+        # passes as 'shc-automation/reports/junit.xml') rather than
+        # hardcoding a bare "reports/" -- cwd differs between a Jenkins run
+        # (workspace root) and a standalone local run (inside
+        # shc-automation), and junit.xml's own path already encodes
+        # whichever is true for this run. Falls back to a bare "reports/"
+        # only when --junitxml wasn't passed (matches this file's own
+        # standalone-run docstring example, invoked from inside
+        # shc-automation). Only ever written on a fresh-enrollment run (no
+        # QR shown on saved-secret runs), so CONTROLLER_SUMMARY only gets
+        # this line when relevant.
+        junitxml_opt = request.config.getoption("--junitxml", default=None) if request else None
+        reports_dir  = Path(junitxml_opt).parent if junitxml_opt else Path("reports")
+        try:
+            qr_path = reports_dir / "qr_code.png"
+            qr_path.parent.mkdir(parents=True, exist_ok=True)
+            qr_path.write_bytes(result.qr_screenshot)
+            if build_url := os.environ.get("BUILD_URL"):
+                CONTROLLER_SUMMARY["QR Code"] = f"{build_url}artifact/{qr_path.as_posix()}"
+        except Exception as e:
+            print(f"[_attach_qr_and_secret] Could not save QR code to {reports_dir} ({e})")
+
     if getattr(result, "secret", ""):
         attach_output(extras, f"TOTP secret{suffix}", result.secret)
 
@@ -208,7 +237,7 @@ def _browser_login_and_screenshot(url: str, email: str, password: str) -> tuple:
 
 def _get_authenticated_session(ops_url: str, email: str,
                                 password: str, mfa_secret: str,
-                                extras: list = None) -> tuple:
+                                extras: list = None, request=None) -> tuple:
     """
     Login to ops-console via playwright to get csrftoken + authenticated cookies.
     Returns: (csrftoken, requests.Session)
@@ -222,7 +251,7 @@ def _get_authenticated_session(ops_url: str, email: str,
     result  = console.login()
 
     if extras is not None:
-        _attach_qr_and_secret(extras, result, suffix=" (admin session)")
+        _attach_qr_and_secret(extras, result, suffix=" (admin session)", request=request)
 
     if not result.success:
         raise RuntimeError(f"Admin login failed: {result.error}")
@@ -352,7 +381,7 @@ class TestConsoleLogin:
         if result.screenshot:
             attach_screenshot(extras, "ops-console dashboard screenshot", result.screenshot)
 
-        _attach_qr_and_secret(extras, result)
+        _attach_qr_and_secret(extras, result, request=request)
 
         if result.success and result.secret and result.secret != mfa_secret:
             _save_secret_to_config(
@@ -416,10 +445,14 @@ class TestOrgAndUser:
         )
 
     def test_create_org_and_user(self, request, controller_fqdn,
-                                  raw_config, extras):
+                                  raw_config, extras, oci_profile_fixture):
         """Create org + admin user via POST /auth/v1/signup/organization/"""
-        star_domain, ops_url, _, console_cfg, org_cfg, partner_id = \
+        star_domain, ops_url, console_url, console_cfg, org_cfg, partner_id = \
             self._resolve(request, controller_fqdn, raw_config)
+
+        CONTROLLER_SUMMARY["Controller FQDN"] = controller_fqdn
+        CONTROLLER_SUMMARY["Console URL"]     = console_url
+        CONTROLLER_SUMMARY["Ops Console URL"] = ops_url
 
         org_name   = org_cfg.get("name",       "onprem-qa")
         username   = org_cfg.get("email",      "onprem@rafay.co")
@@ -443,7 +476,7 @@ class TestOrgAndUser:
                           or console_cfg.get("mfa_secret") or ""
 
         csrftoken, session = _get_authenticated_session(
-            ops_url, admin_email, admin_password, admin_secret, extras=extras
+            ops_url, admin_email, admin_password, admin_secret, extras=extras, request=request
         )
         attach_output(extras, "CSRF token", csrftoken[:15] + "..." if csrftoken else "EMPTY")
 
@@ -485,6 +518,20 @@ class TestOrgAndUser:
         request.session._test_username = username
         request.session._test_password = password
         request.session._star_domain   = star_domain
+
+        CONTROLLER_SUMMARY["Org Name"]             = org_name
+        CONTROLLER_SUMMARY["Username"]              = username
+        CONTROLLER_SUMMARY["Password"]              = password
+        CONTROLLER_SUMMARY["Super Admin Username"]  = admin_email
+        CONTROLLER_SUMMARY["Super Admin Password"]  = admin_password
+
+        if build_url := os.environ.get("BUILD_URL"):
+            CONTROLLER_SUMMARY["SSH Key Download"] = f"{build_url}artifact/keys/oci.key"
+
+        if oci_profile_fixture is not None and oci_profile_fixture.is_custom_ssh_key:
+            CONTROLLER_SUMMARY["Custom SSH Key"] = (
+                "No private key can be generated for user custom public key"
+            )
 
     def test_prelogin_check(self, request, controller_fqdn,
                              raw_config, extras):
@@ -607,7 +654,7 @@ class TestOrgAndUser:
                           or console_cfg.get("mfa_secret") or ""
 
         csrftoken, session = _get_authenticated_session(
-            ops_url, admin_email, admin_password, admin_secret, extras=extras
+            ops_url, admin_email, admin_password, admin_secret, extras=extras, request=request
         )
         headers = {
             "accept":          "application/json, text/plain, */*",
