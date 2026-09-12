@@ -9,13 +9,15 @@ Flow:
     2.  setup_install_dir()    — mkdir /opt/rafay
     3.  fix_dns()              — ensure /etc/resolv.conf is valid
     4.  disable_firewall()     — ufw + iptables flush
-    5.  install_aria2c()       — apt install aria2 (NSG attached/detached)
+    5.  install_download_tools() — apt install aria2 + pigz (NSG attached/detached)
     6.  download_package()     — aria2c -x 16 from S3
-    7.  extract_package()      — tar -xf to /opt/rafay
+    7.  extract_package()      — tar -I pigz -xf to /opt/rafay
     8.  copy_radm_binary()     — cp radm /usr/bin/
     9.  create_config_yaml()   — patch size/ha/type/archive-dir/star-domain
                                  (+ signed cert, if use_signed_cert=True)
-    10. setup_secondary_nodes()— HA only: repeat steps 3-9 on node2+node3
+    10. setup_secondary_nodes()— HA only: repeat steps 3-9 on node2+node3,
+                                 IN PARALLEL (ThreadPoolExecutor, one worker
+                                 per secondary node)
     11. radm_init()            — radm init + kubeconfig + HA join
                                  → polls node Ready every 30s for 5 min
     12. radm_dependency()      — radm dependency
@@ -128,7 +130,7 @@ class ControllerBringup:
         self._phase("setup_install_dir",    self._setup_install_dir)
         self._phase("fix_dns",              self._fix_dns)
         self._phase("disable_firewall",     self._disable_firewall)
-        self._phase("install_aria2c",       self._install_aria2c)
+        self._phase("install_download_tools", self._install_download_tools)
         self._phase("download_package",     self._download_package)
         self._phase("extract_package",      self._extract_package)
         self._phase("copy_radm_binary",     self._copy_radm_binary)
@@ -352,40 +354,47 @@ class ControllerBringup:
         )
         print("[disable_firewall] ufw disabled + iptables flushed ✓")
 
-    def _install_aria2c(self):
-        """Install aria2c. NSG attached for internet access, detached after download."""
-        out, rc = self.ssh.run("which aria2c 2>/dev/null && aria2c --version 2>/dev/null | head -1")
-        if rc == 0 and "aria2" in out.lower():
-            print(f"[install_aria2c] already installed: {out.strip()}")
+    def _install_download_tools(self):
+        """Install aria2c (parallel download) and pigz (parallel gzip, used by
+        _extract_package's `tar -I pigz`). NSG attached for internet access,
+        detached after. Renamed from _install_aria2c now that it installs both."""
+        aria_out, aria_rc = self.ssh.run("which aria2c 2>/dev/null && aria2c --version 2>/dev/null | head -1")
+        pigz_out, pigz_rc = self.ssh.run("which pigz 2>/dev/null")
+        aria_ok = aria_rc == 0 and "aria2" in aria_out.lower()
+        pigz_ok = pigz_rc == 0
+        if aria_ok and pigz_ok:
+            print(f"[install_download_tools] already installed: {aria_out.strip()}, {pigz_out.strip()}")
             return
 
         if self.nsg:
             self.nsg.attach()
-            print("[install_aria2c] NSG attached — waiting 30s for rules to propagate ...")
+            print("[install_download_tools] NSG attached — waiting 30s for rules to propagate ...")
             time.sleep(30)
 
         if self.profile.os_type == "ubuntu24":
             self.ssh.run("sudo apt-get -o Acquire::ForceIPv4=true update -y 2>&1", timeout=120)
-            _, rc = self.ssh.run("sudo apt-get -o Acquire::ForceIPv4=true install -y aria2 2>&1", timeout=180)
+            _, rc = self.ssh.run("sudo apt-get -o Acquire::ForceIPv4=true install -y aria2 pigz 2>&1", timeout=180)
             if rc != 0:
                 _, rc = self.ssh.run(
                     "sudo add-apt-repository universe -y 2>&1 && "
-                    "sudo apt-get update -y 2>&1 && sudo apt-get install -y aria2 2>&1",
+                    "sudo apt-get update -y 2>&1 && sudo apt-get install -y aria2 pigz 2>&1",
                     timeout=300
                 )
-                assert rc == 0, "aria2c install failed"
+                assert rc == 0, "aria2c/pigz install failed"
         else:
-            _, rc = self.ssh.run("sudo yum install -y aria2 2>&1 || sudo dnf install -y aria2 2>&1", timeout=180)
-            assert rc == 0, "aria2c install failed on RHEL"
+            _, rc = self.ssh.run("sudo yum install -y aria2 pigz 2>&1 || sudo dnf install -y aria2 pigz 2>&1", timeout=180)
+            assert rc == 0, "aria2c/pigz install failed on RHEL"
 
         self.ssh.run(
             "sudo iptables -F && sudo iptables -t nat -F && "
             "sudo iptables -t mangle -F && sudo iptables -X 2>/dev/null || true",
             timeout=10
         )
-        verify_out, verify_rc = self.ssh.run("which aria2c")
-        assert verify_rc == 0, "aria2c not found after install"
-        print(f"[install_aria2c] installed at {verify_out.strip()} ✓")
+        aria_verify, aria_verify_rc = self.ssh.run("which aria2c")
+        pigz_verify, pigz_verify_rc = self.ssh.run("which pigz")
+        assert aria_verify_rc == 0, "aria2c not found after install"
+        assert pigz_verify_rc == 0, "pigz not found after install"
+        print(f"[install_download_tools] installed at {aria_verify.strip()}, {pigz_verify.strip()} ✓")
 
     def _download_package(self):
         """Download controller package from S3 using aria2c."""
@@ -435,9 +444,9 @@ class ControllerBringup:
             print(f"[extract_package] already extracted: {self.extract_dir}")
             return
 
-        print(f"[extract_package] Extracting {self.pkg.tar_path} ...")
+        print(f"[extract_package] Extracting {self.pkg.tar_path} (pigz) ...")
         out, rc = self.ssh.run(
-            f"sudo tar -xf {self.pkg.tar_path} -C {self.pkg.install_dir} 2>&1 && echo EXTRACTED",
+            f"sudo tar -I pigz -xf {self.pkg.tar_path} -C {self.pkg.install_dir} 2>&1 && echo EXTRACTED",
             timeout=3600
         )
         assert rc == 0 and "EXTRACTED" in out, f"tar extraction failed: {out[-300:]}"
@@ -548,70 +557,101 @@ class ControllerBringup:
               f"(generate-self-signed-certs=false)")
 
     def _setup_secondary_nodes(self):
-        """HA: full setup on node2 + node3 (download, extract, config.yaml copy)."""
-        from lib.oci.vm_manager import OCINSGManager
-        from lib.ssh.ssh_client import SSHClient
+        """HA: full setup on node2 + node3 (download, extract, config.yaml copy).
+        Each node's SSH session/NSG are independent, so this runs all nodes
+        concurrently via ThreadPoolExecutor instead of one-at-a-time -- cuts
+        HA bringup time roughly by the number of secondary nodes. Unlike the
+        old sequential loop (which stopped at the first failing node), every
+        node is attempted here and failures are collected and raised together
+        at the end, so one bad node no longer blocks setup on the others."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         config_path    = f"{self.extract_dir}/config.yaml"
         config_content, _ = self.ssh.run(f"sudo cat {config_path}")
         encoded_config = base64.b64encode(config_content.encode()).decode()
         padded_ids     = list(self.secondary_ids) + [""] * len(self.secondary_ips)
+        nodes          = list(zip(self.secondary_ips, padded_ids))
 
-        for i, (sec_ip, sec_id) in enumerate(zip(self.secondary_ips, padded_ids), 2):
-            print(f"[setup_secondary_nodes] Setting up node{i} ({sec_ip}) ...")
-            sec_nsg = OCINSGManager(self.oci_profile, sec_id) if (self.oci_profile and self.oci_profile.nsg_id and sec_id) else None
-            sec_ssh = SSHClient(host=sec_ip, user=self.profile.user, key_path=self.profile.ssh_key)
-            sec_ssh.connect()
-            try:
-                sec_ssh.run(f"sudo mkdir -p {self.pkg.install_dir} && sudo chmod 777 {self.pkg.install_dir}")
-                sec_ssh.run(
-                    "sudo ufw disable 2>/dev/null || true && sudo iptables -F && "
-                    "sudo iptables -t nat -F && sudo iptables -t mangle -F && "
-                    "sudo iptables -X 2>/dev/null || true",
-                    timeout=15
-                )
-                check_out, _ = sec_ssh.run(f"test -d {self.extract_dir} && echo EXISTS || echo MISSING")
-                if "MISSING" in check_out:
-                    if sec_nsg:
-                        sec_nsg.attach()
-                        time.sleep(30)
-                    _, aria2c_rc = sec_ssh.run("which aria2c 2>/dev/null")
-                    if aria2c_rc != 0:
-                        sec_ssh.run("sudo apt-get -o Acquire::ForceIPv4=true update -y 2>&1 || true", timeout=120)
-                        sec_ssh.run("sudo apt-get -o Acquire::ForceIPv4=true install -y aria2 2>&1 || true", timeout=180)
-                        sec_ssh.run("sudo iptables -F && sudo iptables -t nat -F && sudo iptables -t mangle -F 2>/dev/null || true", timeout=10)
-                    tar_check, _ = sec_ssh.run(
-                        f"test -f {self.pkg.tar_path} && test ! -f {self.pkg.tar_path}.aria2 && echo COMPLETE || echo MISSING"
-                    )
-                    if "MISSING" in tar_check:
-                        aria2c_bin_out, _ = sec_ssh.run("which aria2c")
-                        aria2c_bin = aria2c_bin_out.strip() or "/usr/bin/aria2c"
-                        dl_out, dl_rc = sec_ssh.run(
-                            f"cd {self.pkg.install_dir} && "
-                            f"sudo {aria2c_bin} -x 16 -s 16 --max-tries=3 --connect-timeout=30 {self.pkg.url} 2>&1",
-                            timeout=1800
-                        )
-                        assert dl_rc == 0, f"Download failed on node{i}: {dl_out[-200:]}"
-                    if sec_nsg:
-                        sec_nsg.detach()
-                    ext_out, ext_rc = sec_ssh.run(
-                        f"sudo tar -xf {self.pkg.tar_path} -C {self.pkg.install_dir} 2>&1 && echo EXTRACTED",
-                        timeout=3600
-                    )
-                    assert ext_rc == 0 and "EXTRACTED" in ext_out, f"Extraction failed on node{i}"
-                else:
-                    print(f"[setup_secondary_nodes] node{i}: already extracted — skipping")
-                    if sec_nsg:
-                        try: sec_nsg.detach()
-                        except: pass
+        print(f"[setup_secondary_nodes] Setting up {len(nodes)} secondary node(s) in parallel ...")
 
-                write_out, write_rc = sec_ssh.run(
-                    f"echo '{encoded_config}' | base64 -d | sudo tee {config_path} > /dev/null && echo OK"
+        with ThreadPoolExecutor(max_workers=len(nodes)) as pool:
+            futures = {
+                pool.submit(self._setup_one_secondary_node, i, sec_ip, sec_id,
+                            config_path, encoded_config): (i, sec_ip)
+                for i, (sec_ip, sec_id) in enumerate(nodes, 2)
+            }
+            errors = []
+            for future in as_completed(futures):
+                i, sec_ip = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    errors.append(f"node{i} ({sec_ip}): {e}")
+
+        if errors:
+            raise AssertionError("Secondary node setup failed:\n" + "\n".join(errors))
+
+    def _setup_one_secondary_node(self, i, sec_ip, sec_id, config_path, encoded_config):
+        """Set up a single secondary node -- runs concurrently with its
+        siblings, called from _setup_secondary_nodes via ThreadPoolExecutor."""
+        from lib.oci.vm_manager import OCINSGManager
+        from lib.ssh.ssh_client import SSHClient
+
+        print(f"[setup_secondary_nodes] Setting up node{i} ({sec_ip}) ...")
+        sec_nsg = OCINSGManager(self.oci_profile, sec_id) if (self.oci_profile and self.oci_profile.nsg_id and sec_id) else None
+        sec_ssh = SSHClient(host=sec_ip, user=self.profile.user, key_path=self.profile.ssh_key)
+        sec_ssh.connect()
+        try:
+            sec_ssh.run(f"sudo mkdir -p {self.pkg.install_dir} && sudo chmod 777 {self.pkg.install_dir}")
+            sec_ssh.run(
+                "sudo ufw disable 2>/dev/null || true && sudo iptables -F && "
+                "sudo iptables -t nat -F && sudo iptables -t mangle -F && "
+                "sudo iptables -X 2>/dev/null || true",
+                timeout=15
+            )
+            check_out, _ = sec_ssh.run(f"test -d {self.extract_dir} && echo EXISTS || echo MISSING")
+            if "MISSING" in check_out:
+                if sec_nsg:
+                    sec_nsg.attach()
+                    time.sleep(30)
+                _, aria2c_rc = sec_ssh.run("which aria2c 2>/dev/null")
+                _, pigz_rc   = sec_ssh.run("which pigz 2>/dev/null")
+                if aria2c_rc != 0 or pigz_rc != 0:
+                    sec_ssh.run("sudo apt-get -o Acquire::ForceIPv4=true update -y 2>&1 || true", timeout=120)
+                    sec_ssh.run("sudo apt-get -o Acquire::ForceIPv4=true install -y aria2 pigz 2>&1 || true", timeout=180)
+                    sec_ssh.run("sudo iptables -F && sudo iptables -t nat -F && sudo iptables -t mangle -F 2>/dev/null || true", timeout=10)
+                tar_check, _ = sec_ssh.run(
+                    f"test -f {self.pkg.tar_path} && test ! -f {self.pkg.tar_path}.aria2 && echo COMPLETE || echo MISSING"
                 )
-                assert write_rc == 0 and "OK" in write_out, f"config.yaml copy failed on node{i}"
-                print(f"[setup_secondary_nodes] node{i} ({sec_ip}) ready ✓")
-            finally:
-                sec_ssh.disconnect()
+                if "MISSING" in tar_check:
+                    aria2c_bin_out, _ = sec_ssh.run("which aria2c")
+                    aria2c_bin = aria2c_bin_out.strip() or "/usr/bin/aria2c"
+                    dl_out, dl_rc = sec_ssh.run(
+                        f"cd {self.pkg.install_dir} && "
+                        f"sudo {aria2c_bin} -x 16 -s 16 --max-tries=3 --connect-timeout=30 {self.pkg.url} 2>&1",
+                        timeout=1800
+                    )
+                    assert dl_rc == 0, f"Download failed on node{i}: {dl_out[-200:]}"
+                if sec_nsg:
+                    sec_nsg.detach()
+                ext_out, ext_rc = sec_ssh.run(
+                    f"sudo tar -I pigz -xf {self.pkg.tar_path} -C {self.pkg.install_dir} 2>&1 && echo EXTRACTED",
+                    timeout=3600
+                )
+                assert ext_rc == 0 and "EXTRACTED" in ext_out, f"Extraction failed on node{i}"
+            else:
+                print(f"[setup_secondary_nodes] node{i}: already extracted — skipping")
+                if sec_nsg:
+                    try: sec_nsg.detach()
+                    except: pass
+
+            write_out, write_rc = sec_ssh.run(
+                f"echo '{encoded_config}' | base64 -d | sudo tee {config_path} > /dev/null && echo OK"
+            )
+            assert write_rc == 0 and "OK" in write_out, f"config.yaml copy failed on node{i}"
+            print(f"[setup_secondary_nodes] node{i} ({sec_ip}) ready ✓")
+        finally:
+            sec_ssh.disconnect()
 
     def _radm_init(self):
         """radm init on node1, kubeconfig setup, HA join on node2+3."""
