@@ -671,8 +671,7 @@ class ControllerBringup:
 
         print("[radm_init] Running radm init ...")
         out, rc = self.ssh.run(
-            f"cd {self.extract_dir} && sudo ./radm init --config config.yaml "
-            f"--skip-phases infra/containerd/install-containerd-config-toml 2>&1",
+            f"cd {self.extract_dir} && sudo ./radm init --config config.yaml 2>&1",
             timeout=1800,
         )
         assert rc == 0, f"radm init failed (exit {rc}): {out[-500:]}"
