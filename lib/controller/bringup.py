@@ -127,6 +127,7 @@ class ControllerBringup:
         print(f"[bringup]   cert    : {'signed (Lets Encrypt)' if self.use_signed_cert else 'self-signed'}")
         print("═" * 60 + "\n")
 
+        self._phase("authorize_custom_ssh_key", self._authorize_custom_ssh_key)
         self._phase("setup_install_dir",    self._setup_install_dir)
         self._phase("fix_dns",              self._fix_dns)
         self._phase("disable_firewall",     self._disable_firewall)
@@ -301,6 +302,36 @@ class ControllerBringup:
             print(f"[health] iostat stop/read failed (non-fatal): {e}")
 
     # ── Phase implementations ─────────────────────────────────────────────────
+
+    def _authorize_custom_ssh_key(self):
+        """Append the user-uploaded custom SSH public key (if any) to
+        ~/.ssh/authorized_keys directly over the already-open SSH session,
+        rather than relying solely on OCI instance metadata / cloud-init to
+        apply it. Needed because some golden images have stale cloud-init
+        state baked into them (a semaphore file captured at image-build time)
+        that makes cloud-init skip re-applying ssh_authorized_keys metadata
+        on every VM booted from that image -- confirmed on shc-126
+        (`cloud-init status --long` showed `last_update: Thu, 01 Jan 1970
+        00:00:21` -- an epoch-zero timestamp -- and authorized_keys only had
+        the image's original 2021 key, not the freshly-attached metadata
+        key). This runs over self.ssh, which only works because connecting
+        at all already required the default key to be authorized some other
+        way (baked into the image, in this case) -- it doesn't fix a VM
+        that's unreachable by any key, only makes the custom key delivery
+        itself independent of cloud-init once a connection exists."""
+        if not (self.oci_profile and self.oci_profile.is_custom_ssh_key):
+            return
+        import base64
+        extra_key = base64.b64decode(self.oci_profile.extra_ssh_public_key_b64).decode().strip()
+        assert extra_key.startswith("ssh-"), "Decoded extra_ssh_public_key_b64 doesn't look like a public key"
+        out, rc = self.ssh.run(
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
+            f"grep -qxF '{extra_key}' ~/.ssh/authorized_keys 2>/dev/null || "
+            f"echo '{extra_key}' >> ~/.ssh/authorized_keys && "
+            "chmod 600 ~/.ssh/authorized_keys && echo OK"
+        )
+        assert rc == 0, f"Failed to authorize custom SSH key: {out[-300:]}"
+        print("[authorize_custom_ssh_key] custom public key appended to authorized_keys ✓")
 
     def _setup_install_dir(self):
         out, rc = self.ssh.run(
@@ -602,6 +633,17 @@ class ControllerBringup:
         sec_ssh = SSHClient(host=sec_ip, user=self.profile.user, key_path=self.profile.ssh_key)
         sec_ssh.connect()
         try:
+            if self.oci_profile and self.oci_profile.is_custom_ssh_key:
+                import base64
+                extra_key = base64.b64decode(self.oci_profile.extra_ssh_public_key_b64).decode().strip()
+                assert extra_key.startswith("ssh-"), "Decoded extra_ssh_public_key_b64 doesn't look like a public key"
+                _, key_rc = sec_ssh.run(
+                    "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
+                    f"grep -qxF '{extra_key}' ~/.ssh/authorized_keys 2>/dev/null || "
+                    f"echo '{extra_key}' >> ~/.ssh/authorized_keys && "
+                    "chmod 600 ~/.ssh/authorized_keys && echo OK"
+                )
+                assert key_rc == 0, f"Failed to authorize custom SSH key on node{i}"
             sec_ssh.run(f"sudo mkdir -p {self.pkg.install_dir} && sudo chmod 777 {self.pkg.install_dir}")
             sec_ssh.run(
                 "sudo ufw disable 2>/dev/null || true && sudo iptables -F && "
