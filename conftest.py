@@ -563,6 +563,8 @@ def controller_bringup(
         nsg_manager=nsg_manager,
         use_signed_cert=request.config.getoption("--signed-cert"),
         cert_email=raw_config.get("certs", {}).get("email", ""),
+        build_no=request.config.getoption("--build-no") or "",
+        controller_ip=getattr(request.session, "_tf_public_ip", ""),
     )
 
     try:
@@ -571,6 +573,19 @@ def controller_bringup(
         pytest.fail(f"Controller bringup failed at phase [{e.phase}]: {e}")
 
     yield
+
+    # dev-noc cleanup on teardown, gated the same way VM destroy already is
+    # (run_cleanup) -- request.session._keep_vm (set above) already tracks
+    # this same decision. Non-fatal: DevNocManager.cleanup() itself never
+    # raises. NOTE: this fires whenever this fixture tears down, which
+    # includes normal end-of-session teardown -- if teardown ALSO destroys
+    # the VM somewhere else in this codebase gated by --keep-vm, that's the
+    # right place this call should live alongside; wiring it in here since
+    # this fixture is what constructed `bringup` and is the only thing with
+    # a reference to it, but flagging in case the actual destroy call lives
+    # in a different fixture/teardown path than this one.
+    if not getattr(request.session, "_keep_vm", False):
+        bringup.cleanup_dev_noc()
 
 
 # ── controller_upgrade fixture ────────────────────────────────────────────────
