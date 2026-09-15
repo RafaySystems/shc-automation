@@ -59,6 +59,13 @@ DEVNOC_SSH_CONFIG_DIR = "/etc/ssh/ssh_config.d"
 # Shared file all users read -- e.g. via `export KUBECONFIG=/opt/shc-kubeconfig/config`
 # in a shell profile snippet, or `kubectl --kubeconfig=/opt/shc-kubeconfig/config`.
 DEVNOC_SHARED_KUBECONFIG = "/opt/shc-kubeconfig/config"
+# The OS user everyone actually lands as when connecting to dev-noc via SSM
+# (confirmed: `aws ssm start-session ...` puts you at `ubuntu@ip-...`, not
+# root, and not a per-person account). Key files must be owned by THIS
+# user, not root -- chmod 600 root-owned key files can only be read by
+# root itself, which is what everyone actually running `ssh shc-<n>`
+# is NOT.
+DEVNOC_LOCAL_USER = "ubuntu"
 
 
 def _rename_kubeconfig_entries(kubeconfig_content: str, host_alias: str) -> str:
@@ -164,7 +171,13 @@ class DevNocManager:
             f"sudo mkdir -p {DEVNOC_KEY_DIR}",
             f"echo {key_b64} | base64 -d | sudo tee {key_path} > /dev/null",
             f"sudo chmod 600 {key_path}",
-            f"sudo chown root:root {key_path}",
+            # root:root here is unreadable by anyone actually running `ssh
+            # shc-<n>` -- everyone connects to dev-noc as DEVNOC_LOCAL_USER
+            # (ubuntu), not root, via SSM. Confirmed broken on shc-2:
+            # "Load key '/opt/shc-keys/shc-2.key': Permission denied"
+            # before SSH even got to its own key-content validation --
+            # this was a plain filesystem read failure.
+            f"sudo chown {DEVNOC_LOCAL_USER}:{DEVNOC_LOCAL_USER} {key_path}",
             f"sudo mkdir -p {DEVNOC_SSH_CONFIG_DIR}",
             (
                 f"printf 'Host {host_alias}\\n"
