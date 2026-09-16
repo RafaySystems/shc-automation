@@ -97,6 +97,8 @@ class ControllerBringup:
         nsg_manager=None,
         use_signed_cert:         bool = False,
         cert_email:              str = "",
+        build_no:                str = "",
+        controller_ip:           str = "",
     ):
         self.ssh             = ssh_client
         self.profile         = controller_profile
@@ -108,6 +110,8 @@ class ControllerBringup:
         self.nsg             = nsg_manager
         self.use_signed_cert = use_signed_cert
         self.cert_email      = cert_email
+        self.build_no        = build_no
+        self.controller_ip   = controller_ip
         self.extract_dir     = None   # set after extraction
 
     # ── Public entry point ────────────────────────────────────────────────────
@@ -149,6 +153,11 @@ class ControllerBringup:
         self._stop_iostat_capture("radm_cluster")
         self._snapshot_health("after radm_cluster")
         self._deep_diagnostics("after radm_cluster")
+
+        if self.build_no and self.controller_ip:
+            self._phase("configure_dev_noc", self._configure_dev_noc)
+        else:
+            print("[bringup] build_no/controller_ip not provided — skipping dev-noc configuration")
 
         print("\n" + "═" * 60)
         print(f"[bringup] ✅ Controller bringup complete")
@@ -783,6 +792,29 @@ class ControllerBringup:
         entirely on v3.1.x-master-1-35 — build #31 RCA) and re-deriving
         values radm init already handed us was unnecessary scope creep.
         radm init is the single source of truth for these values.
+
+        NOTE: an etcd-learner-never-promoted failure (radm join succeeds,
+        but the new member is left stuck as a non-voting learner --
+        confirmed on shc-127, fixable manually via `etcdctl member
+        promote`) is NOT worked around here. Per the standing rule that
+        automation must not add steps absent from the manual bringup
+        documentation: if the documented manual process is just `radm
+        init` + `radm join` with no etcd-learner check, then a real
+        customer following those same docs would hit this exact failure
+        too -- silently promoting the learner in automation would hide a
+        genuine radm/kubeadm bug behind a green test run instead of
+        surfacing it. This should be filed as a product bug against
+        radm's join/promotion sequence, not patched around in test code.
+
+        Each secondary node's join is still isolated in its own
+        try/except -- confirmed on shc-127 that a failure on node2
+        silently skipped node3 entirely (kubelet.service didn't even
+        exist there). That part is a pure test-harness robustness fix
+        (which nodes get ATTEMPTED), not a change to what runs ON any
+        node, so it doesn't fall under the same rule -- errors are
+        collected and raised together at the end so every node is always
+        attempted, matching the pattern already used in
+        _setup_secondary_nodes.
         """
         pri_ip, token, ca_hash, cert_key = self._parse_ha_join_from_output(radm_init_output)
 
@@ -795,47 +827,62 @@ class ControllerBringup:
         print("[ha_join] Waiting 60s for etcd to stabilize ...")
         time.sleep(60)
 
+        errors = []
         for i, sec_ip in enumerate(self.secondary_ips, 2):
-            prereq = [
-                "ssh", "-i", self.profile.ssh_key,
-                "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=30", f"{self.profile.user}@{sec_ip}",
-                f"sudo systemctl stop consul 2>/dev/null || true && "
-                f"sudo rm -rf /var/lib/consul /etc/consul.d/rafay*.hcl /etc/consul.d/rafay*.json 2>/dev/null || true && "
-                f"sudo mkdir -p /run/systemd/resolve && "
-                f"printf 'nameserver 169.254.169.254\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n' "
-                f"| sudo tee /run/systemd/resolve/resolv.conf > /dev/null && "
-                f"sudo rm -f /etc/resolv.conf && "
-                f"printf 'nameserver 169.254.169.254\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n' "
-                f"| sudo tee /etc/resolv.conf > /dev/null && "
-                f"grep -q 'k8master.service.edgedc.consul' /etc/hosts || "
-                f"echo '{pri_ip} k8master.service.edgedc.consul' | sudo tee -a /etc/hosts && echo PREREQ_DONE"
-            ]
-            subprocess.run(prereq, capture_output=True, text=True, timeout=30)
+            try:
+                prereq = [
+                    "ssh", "-i", self.profile.ssh_key,
+                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "ConnectTimeout=30", f"{self.profile.user}@{sec_ip}",
+                    f"sudo systemctl stop consul 2>/dev/null || true && "
+                    f"sudo rm -rf /var/lib/consul /etc/consul.d/rafay*.hcl /etc/consul.d/rafay*.json 2>/dev/null || true && "
+                    f"sudo mkdir -p /run/systemd/resolve && "
+                    f"printf 'nameserver 169.254.169.254\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n' "
+                    f"| sudo tee /run/systemd/resolve/resolv.conf > /dev/null && "
+                    f"sudo rm -f /etc/resolv.conf && "
+                    f"printf 'nameserver 169.254.169.254\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n' "
+                    f"| sudo tee /etc/resolv.conf > /dev/null && "
+                    f"grep -q 'k8master.service.edgedc.consul' /etc/hosts || "
+                    f"echo '{pri_ip} k8master.service.edgedc.consul' | sudo tee -a /etc/hosts && echo PREREQ_DONE"
+                ]
+                subprocess.run(prereq, capture_output=True, text=True, timeout=30)
 
-            ssh_join = [
-                "ssh", "-i", self.profile.ssh_key,
-                "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=60",
-                "-o", "ConnectTimeout=30", f"{self.profile.user}@{sec_ip}",
-                join_cmd
-            ]
-            join_rc  = 1
-            join_out = ""
-            for attempt in range(1, 4):
-                if attempt > 1:
-                    print(f"[ha_join] node{i}: retry {attempt}/3 ...")
-                    time.sleep(30)
-                result   = subprocess.run(ssh_join, capture_output=True, text=True, timeout=1800)
-                join_out = (result.stdout + result.stderr).strip()
-                join_rc  = result.returncode
-                if join_rc == 0:
-                    break
-                if "can only promote a learner" not in join_out and "FailedPrecondition" not in join_out:
-                    break
+                ssh_join = [
+                    "ssh", "-i", self.profile.ssh_key,
+                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=60",
+                    "-o", "ConnectTimeout=30", f"{self.profile.user}@{sec_ip}",
+                    join_cmd
+                ]
+                join_rc  = 1
+                join_out = ""
+                for attempt in range(1, 4):
+                    if attempt > 1:
+                        print(f"[ha_join] node{i}: retry {attempt}/3 ...")
+                        time.sleep(30)
+                    result   = subprocess.run(ssh_join, capture_output=True, text=True, timeout=1800)
+                    join_out = (result.stdout + result.stderr).strip()
+                    join_rc  = result.returncode
+                    if join_rc == 0:
+                        break
+                    # Full output printed here (not just a truncated tail)
+                    # so the actual failed pre-flight check row is visible
+                    # in console -- `radm join`'s own pre-flight table can
+                    # run to several KB.
+                    print(f"[ha_join] node{i} attempt {attempt}/3 failed (exit {join_rc}):\n{join_out}\n")
+                    if "can only promote a learner" not in join_out and "FailedPrecondition" not in join_out:
+                        break
 
-            assert join_rc == 0, f"radm join failed on node{i} ({sec_ip}): {join_out[-300:]}"
-            print(f"[ha_join] node{i} ({sec_ip}) joined ✓")
+                assert join_rc == 0, (
+                    f"radm join failed on node{i} ({sec_ip}) after {attempt} attempt(s) -- "
+                    f"see full output printed above"
+                )
+                print(f"[ha_join] node{i} ({sec_ip}) joined ✓")
+            except Exception as e:
+                errors.append(f"node{i} ({sec_ip}): {e}")
+
+        if errors:
+            raise AssertionError("HA join failed:\n" + "\n".join(errors))
 
     def _radm_dependency(self):
         """
@@ -949,6 +996,69 @@ class ControllerBringup:
             else:
                 # Non-502 failure — fail immediately, don't retry
                 raise Exception(f"radm cluster failed (exit {rc}): {out[-300:]}")
+
+    def _configure_dev_noc(self):
+        """
+        Configure dev-noc so `ssh shc-<build_no>` reaches this controller,
+        and a `shc-<build_no>` kubeconfig context is merged into dev-noc's
+        shared kubeconfig. Runs once, after radm_cluster succeeds -- "as
+        soon as the controller is fully up."
+
+        Pulls the private key content from self.profile.ssh_key (the same
+        file already used for every other SSH connection in this class)
+        and /etc/kubernetes/admin.conf from this node (self.ssh, already
+        connected) -- no new credentials/config needed beyond what
+        bringup already has.
+
+        Non-fatal by design: dev-noc access is a convenience for humans,
+        not a correctness requirement for the controller itself. A failure
+        here is logged loudly but does not fail the overall bringup --
+        matches the intent of the whole feature (this should never be the
+        reason a CI run goes red).
+        """
+        from lib.devnoc.devnoc_manager import DevNocManager, DevNocError
+
+        try:
+            with open(self.profile.ssh_key, "r") as f:
+                ssh_key_content = f.read()
+        except Exception as e:
+            print(f"[configure_dev_noc] Could not read private key at {self.profile.ssh_key} ({e}) — skipping")
+            return
+
+        kubeconfig_out, kubeconfig_rc = self.ssh.run("sudo cat /etc/kubernetes/admin.conf")
+        if kubeconfig_rc != 0 or not kubeconfig_out.strip():
+            print(f"[configure_dev_noc] Could not read /etc/kubernetes/admin.conf (exit {kubeconfig_rc}) — skipping")
+            return
+
+        try:
+            devnoc = DevNocManager()
+            devnoc.configure(
+                build_no=self.build_no,
+                controller_ip=self.controller_ip,
+                ssh_key_content=ssh_key_content,
+                kubeconfig_content=kubeconfig_out,
+                user=self.profile.user,
+            )
+            print(f"[configure_dev_noc] dev-noc configured — 'ssh shc-{self.build_no}' and "
+                  f"kubectl context 'shc-{self.build_no}' should now work from dev-noc ✓")
+        except DevNocError as e:
+            print(f"[configure_dev_noc] WARNING — dev-noc configuration failed (non-fatal): {e}")
+
+    def cleanup_dev_noc(self):
+        """
+        Remove this build's SSH alias + kubeconfig context from dev-noc.
+        NOT wired into run() -- call this explicitly from wherever teardown
+        already runs (the same place that decides run_cleanup / destroys
+        the VM), since ControllerBringup itself has no teardown/destroy
+        logic of its own to hook onto. Safe to call even if
+        _configure_dev_noc never ran or failed -- DevNocManager.cleanup()
+        is itself non-fatal on failure.
+        """
+        if not self.build_no:
+            print("[cleanup_dev_noc] build_no not set — nothing to clean up")
+            return
+        from lib.devnoc.devnoc_manager import DevNocManager
+        DevNocManager().cleanup(self.build_no)
 
     # ── Poll helpers ──────────────────────────────────────────────────────────
 
