@@ -666,10 +666,23 @@ class TestOrgAndUser:
         }
 
         # ── Step 1: make onprem-qa the default org (real action) ───────────
+        # NOTE: deliberately NOT filtering by partner_id here. dev.yaml's
+        # console.partner_id ("4qkolkn" as of this writing) was captured
+        # once from browser DevTools against one specific controller -- it
+        # is NOT a stable/universal value. Every fresh bringup provisions
+        # its own brand-new controller with its own internal default
+        # partner id, so a stale partner_id silently filters this list down
+        # to zero results even though the org exists (confirmed against
+        # build #138: signup succeeded, prelogin/login as the new user both
+        # succeeded, but this query returned {"count":0,...} because the
+        # partner_id filter didn't match this build's actual partner).
+        # The org-name match right below already does the real filtering,
+        # so a partner_id param here only adds a way to wrongly exclude the
+        # org we just created.
         print(f"[sku_load] Looking up org id for '{org_name}' ...")
         orgs_resp = session.get(
             f"{ops_url}/auth/v1/organizations/",
-            params={"limit": 10, "offset": 0, "partner_id": partner_id},
+            params={"limit": 10, "offset": 0},
             headers=headers, timeout=15,
         )
         attach_output(extras, "Organizations list status", str(orgs_resp.status_code))
