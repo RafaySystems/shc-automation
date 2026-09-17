@@ -172,8 +172,20 @@ class TerraformManager:
             ocpus     = p.ocpus
             memory_gb = p.memory_gb
 
+        tags = dict(p.tags or {})
+
+        # owner tag: prefer the Jenkins-captured triggering user (set by
+        # Rauto.jenkinsfile as TRIGGERED_BY_EMAIL); fall back to whatever
+        # literal value dev.yaml has, for local/non-Jenkins runs.
+        triggered_by_email = os.environ.get("TRIGGERED_BY_EMAIL")
+        if triggered_by_email:
+            tags["owner"] = triggered_by_email
+
+        def _hcl_escape(value: str) -> str:
+            return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
         tags_hcl = "{\n" + "".join(
-            f'  "{k}" = "{v}"\n' for k, v in (p.tags or {}).items()
+            f'  "{k}" = "{_hcl_escape(v)}"\n' for k, v in tags.items()
         ) + "}"
 
         content = f"""\
