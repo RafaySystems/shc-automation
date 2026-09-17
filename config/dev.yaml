@@ -13,11 +13,10 @@ controller:
   controller_size: S
   ha: true
   ip: 129.153.120.157
-  ssh_key: "${RAUTO_OCI_SSH_KEY}"
+  ssh_key: "${RAUTO_OCI_SSH_KEY:-/Users/vijay/Documents/rafay-pytest-framework/keys/oci.key}"
   os_type: ubuntu24
   provision: false
   secondary_ips: []
-  ssh_key: /Users/vijay/Documents/rafay-pytest-framework/keys/oci.key
   user: ubuntu
 dns:
   aws_profile: 
@@ -29,7 +28,7 @@ kubectl:
   kubeconfig_path: ~/.kube/config
 oci:
   availability_domain: PaOl:PHX-AD-1
-  ssh_public_key: "${RAUTO_OCI_SSH_PUBLIC_KEY}"
+  ssh_public_key: "${RAUTO_OCI_SSH_PUBLIC_KEY:-/Users/vijay/Documents/rafay-pytest-framework/keys/oci.key.pub}"
   boot_timeout: 300
   boot_volume_gb: 1100
   compartment_id: ocid1.compartment.oc1..aaaaaaaadbipnkdi7rrn6ksl3ar64cn27uu2wd63ek7w7nx7e3fnk5n5omiq
@@ -40,11 +39,10 @@ oci:
   nsg_id: ocid1.networksecuritygroup.oc1.phx.aaaaaaaaadw43qbzlrucw7ulmspk5obfhugfnrckxoob4nlsinr3cuupne5q
   profile: DEFAULT
   shape: VM.Standard.E5.Flex
-  ssh_public_key: /Users/vijay/Documents/rafay-pytest-framework/keys/oci.key.pub
   subnet_id: ocid1.subnet.oc1.phx.aaaaaaaaxc7ait6l2jrhdvmahoeefwyliua27uic4l7iha4ynykmabz5sjkq
   tags:
     env: dev
-    owner: vijay@rafay.co
+    owner: "${TRIGGERED_BY_EMAIL:-vijay@rafay.co}"
     project: rafay-airgap
   vcn_id: ocid1.vcn.oc1.phx.amaaaaaaymbj47qaaozxzu7c2msuz3qxnji4evyzzfwrrqx7jo2zxabkl2bq
 package:
