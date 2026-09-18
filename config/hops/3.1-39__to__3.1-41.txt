@@ -1,0 +1,72 @@
+[pre_commands]
+
+# Cleanup tmp
+sudo rm -rf /tmp/radm.log /tmp/rafay-dep* /tmp/rafay-cluster* /tmp/rafay-core* /tmp/istio-* 2>/dev/null || true
+
+# Install pigz for faster extraction
+sudo apt-get -o Acquire::ForceIPv4=true install -y pigz 2>&1 || true
+
+#remove default storage class
+kubectl patch storageclass openebs-hostpath --type=json -p='[{"op":"remove","path":"/metadata/annotations/storageclass.kubernetes.io~1is-default-class"}]'
+
+#Patch the istio CRDs, nexus and redis
+for crd in $(kubectl get crd -o name | grep -E '\.istio\.io$'); do echo "Patching $crd"; kubectl annotate "$crd" meta.helm.sh/release-name=istio-base meta.helm.sh/release-namespace=istio-system --overwrite; kubectl label "$crd" app.kubernetes.io/managed-by=Helm --overwrite; done
+kubectl annotate crd istiooperators.install.istio.io meta.helm.sh/release-name=istio-base meta.helm.sh/release-namespace=istio-system --overwrite 2>/dev/null
+kubectl label crd istiooperators.install.istio.io app.kubernetes.io/managed-by=Helm --overwrite 2>/dev/null
+kubectl get cm,sts,svc,destinationrule -n rafay-core -o json | jq -r '.items[] | select(.metadata.annotations["meta.helm.sh/release-name"]=="rafay-core") | select(.metadata.name|test("nexus")) | "\(.kind)/\(.metadata.name)"' | while read -r r; do kubectl annotate -n rafay-core "$r" meta.helm.sh/release-name=rafay-repo meta.helm.sh/release-namespace=rafay-core --overwrite; kubectl label -n rafay-core "$r" app.kubernetes.io/managed-by=Helm --overwrite; done
+kubectl get sts -n rafay-core redis-master redis-replicas
+kubectl delete sts -n rafay-core redis-master redis-replicas
+kubectl annotate ds redis-replicas -n rafay-core meta.helm.sh/release-name=redis meta.helm.sh/release-namespace=rafay-core --overwrite && kubectl label ds redis-replicas -n rafay-core app.kubernetes.io/managed-by=Helm --overwrite
+kubectl annotate deploy redis-master -n rafay-core meta.helm.sh/release-name=redis meta.helm.sh/release-namespace=rafay-core --overwrite && kubectl label deploy redis-master -n rafay-core app.kubernetes.io/managed-by=Helm --overwrite
+kubectl delete $(kubectl api-resources --verbs=list --namespaced -o name | tr '\n' ',' | sed 's/,$//') -l app.kubernetes.io/part-of=kube-prometheus-stack -n rafay-core
+
+#Delete all the rafay-tsdb related entries
+kubectl delete secrets -n rafay-core rafay-tsdb-certificate rafay-tsdb-credentials rafay-tsdb-pgbackrest
+kubectl delete sts -n rafay-core rafay-tsdb
+kubectl delete pvc -n rafay-core storage-volume-rafay-tsdb-0 storage-volume-rafay-tsdb-1 wal-volume-rafay-tsdb-0 wal-volume-rafay-tsdb-1 storage-volume-rafay-tsdb-2 wal-volume-rafay-tsdb-2
+kubectl delete svc -n rafay-core rafay-tsdb rafay-tsdb-config rafay-tsdb-replica
+kubectl delete ep -n rafay-core rafay-tsdb rafay-tsdb-config rafay-tsdb-replica
+
+#Install helm on node
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+#Patch the clickhouse
+kubectl -n rafay-core get sts clickhouse clickhouse-keeper -o custom-columns='NAME:.metadata.name,VCT:.spec.volumeClaimTemplates[*].metadata.name,SIZE:.spec.volumeClaimTemplates[*].spec.resources.requests.storage,PVCPOLICY:.spec.persistentVolumeClaimRetentionPolicy,SC:.spec.volumeClaimTemplates[*].spec.storageClassName'
+kubectl -n rafay-core get pvc | grep -E 'clickhouse|keeper'
+kubectl get pvc -n rafay-core clickhouse-storage-clickhouse-0 -o jsonpath='{.spec.storageClassName}{"\n"}'
+kubectl patch storageclass openebs-hostpath -p '{"allowVolumeExpansion":true}'
+for pvc in clickhouse-storage-clickhouse-0 clickhouse-storage-clickhouse-1; do pv=$(kubectl -n rafay-core get pvc "$pvc" -o jsonpath='{.spec.volumeName}'); echo "Patching $pvc -> $pv to 200Gi"; kubectl patch pv "$pv" --type merge -p '{"spec":{"capacity":{"storage":"200Gi"}}}'; kubectl patch pvc "$pvc" -n rafay-core --type merge -p '{"spec":{"resources":{"requests":{"storage":"200Gi"}}}}'; done
+for pvc in keeper-storage-clickhouse-keeper-0 keeper-storage-clickhouse-keeper-1 keeper-storage-clickhouse-keeper-2; do pv=$(kubectl -n rafay-core get pvc "$pvc" -o jsonpath='{.spec.volumeName}'); echo "Patching $pvc -> $pv to 5Gi"; kubectl patch pv "$pv" --type merge -p '{"spec":{"capacity":{"storage":"5Gi"}}}'; kubectl patch pvc "$pvc" -n rafay-core --type merge -p '{"spec":{"resources":{"requests":{"storage":"5Gi"}}}}'; done
+kubectl -n rafay-core get pvc -l 'app in (clickhouse,clickhouse-keeper)' -o custom-columns='NAME:.metadata.name,REQ:.spec.resources.requests.storage,CAP:.status.capacity.storage,PV:.spec.volumeName'
+kubectl -n rafay-core delete sts clickhouse clickhouse-keeper --cascade=orphan
+
+[after_radm_dependency]
+#Restart statefulsets
+kubectl rollout restart statefulset -n rafay-core
+
+#Scale down and up the clickhouse pods
+kubectl scale sts -n rafay-core clickhouse clickhouse-keeper --replicas=0
+sleep 60 && kubectl scale sts -n rafay-core clickhouse --replicas=2
+kubectl scale sts -n rafay-core clickhouse-keeper --replicas=3
+
+[config_patches]
+sed -i '/cluster-images-archive:/,/file:/ s|file:.*|file: rafay-cluster-images-multiarch-v3.1-41.tar.gz|' config.yaml
+
+[expected_es_version]
+9.4.4
+
+#Patch the frontend logo
+kubectl -n rafay-core annotate configmap frontend-logo meta.helm.sh/release-name=rafay-core meta.helm.sh/release-namespace=rafay-core --overwrite
+kubectl -n rafay-core label configmap frontend-logo app.kubernetes.io/managed-by=Helm --overwrite
+
+[expected_postgresql_status]
+Running
+
+[after_radm_application]
+cd /opt/rafay/rafay-airgapped-controller-v3.1-39/ && sudo radm cluster --config config.yaml
+kubectl set env deployment/paas-api WORKSPACE_API_ALLOW_DAY2_OPERATIONS=true -n rafay-core
+
+[after_radm_cluster]
+sudo aria2c -x 16 -s 16 -d /opt/rafay/rafay-airgapped-controller-v3.1-41 https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/3.1/rafay-cluster-images-multiarch-v3.1-41.tar.gz
+
+

@@ -89,7 +89,7 @@
             "rauto_branch": "master"
           },
           "3.1.41": {
-            "package_url": "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/3.1/rafay-airgapped-controller-v3.1-41.tar.gz",
+            "package_url": "https://dev-rafay-controller.s3.us-west-1.amazonaws.com/Automation/dev-rafay-airgapped-controller-v3.1-41.tar.gz",
             "notes": "Latest GPU-PaaS release. No further hop defined yet.",
             "can_upgrade_to": [],
             "rctl_build": "v3.1.x-4",
