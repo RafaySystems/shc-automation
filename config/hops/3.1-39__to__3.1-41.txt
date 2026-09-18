@@ -29,6 +29,8 @@ kubectl delete ep -n rafay-core rafay-tsdb rafay-tsdb-config rafay-tsdb-replica
 
 #Install helm on node
 curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+sudo ln -sf /usr/local/bin/helm /usr/bin/helm
+/usr/bin/helm version
 
 #Patch the clickhouse
 kubectl -n rafay-core get sts clickhouse clickhouse-keeper -o custom-columns='NAME:.metadata.name,VCT:.spec.volumeClaimTemplates[*].metadata.name,SIZE:.spec.volumeClaimTemplates[*].spec.resources.requests.storage,PVCPOLICY:.spec.persistentVolumeClaimRetentionPolicy,SC:.spec.volumeClaimTemplates[*].spec.storageClassName'
