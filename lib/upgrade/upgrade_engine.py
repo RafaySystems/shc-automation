@@ -268,7 +268,7 @@ class UpgradeEngine:
     def _radm_dependency(self):
         print("[radm_dependency] Running ...")
         out, rc = self.ssh.run(
-            f"cd {self.dst_extract_dir} && sudo ./radm dependency --config config.yaml 2>&1",
+            f"cd {self.dst_extract_dir} && sudo ./radm dependency --config config.yaml --skip-preflight 2>&1",
             timeout=1800,
         )
         assert rc == 0, f"radm dependency failed (exit {rc}): {out[-300:]}"
@@ -358,7 +358,7 @@ class UpgradeEngine:
     def _radm_application(self):
         print("[radm_application] Running ...")
         out, rc = self.ssh.run(
-            f"cd {self.dst_extract_dir} && sudo ./radm application --config config.yaml 2>&1",
+            f"cd {self.dst_extract_dir} && sudo ./radm application --config config.yaml --skip-preflight 2>&1",
             timeout=2400,
         )
         assert rc == 0, f"radm application failed (exit {rc}): {out[-300:]}"
@@ -374,7 +374,7 @@ class UpgradeEngine:
         """
         print(f"[radm_cluster] Running from {self.dst_extract_dir} ...")
         out, rc = self.ssh.run_stream(
-            f"cd {self.dst_extract_dir} && sudo ./radm cluster --config config.yaml 2>&1",
+            f"cd {self.dst_extract_dir} && sudo ./radm cluster --config config.yaml --skip-preflight 2>&1",
             timeout=2400, prefix="[radm cluster]",
         )
         assert rc == 0, f"radm cluster failed (exit {rc}): {out[-300:]}"
