@@ -652,10 +652,14 @@ def controller_upgrade(
     post_commands = canned["post_commands"]
     after_radm_cluster_commands = canned["after_radm_cluster"]
     expected_es_version = canned["expected_es_version"]
+    expected_postgresql_status = canned["expected_postgresql_status"]
 
     if expected_es_version:
         print(f"[conftest] expected_es_version={expected_es_version} loaded from config/hops/ -- "
               f"wait_elasticsearch will gate on this exact version")
+    if expected_postgresql_status:
+        print(f"[conftest] expected_postgresql_status={expected_postgresql_status} loaded from config/hops/ -- "
+              f"wait_postgresql will gate on this exact status")
 
     for key, label in [
         ("pre_commands", "pre-dependency"), ("config_patches", "config_patches"),
@@ -694,6 +698,7 @@ def controller_upgrade(
         post_commands=post_commands,
         after_radm_cluster_commands=after_radm_cluster_commands,
         expected_es_version=expected_es_version,
+        expected_postgresql_status=expected_postgresql_status,
     )
 
     try:

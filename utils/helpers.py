@@ -23,6 +23,7 @@ _PATCH_SECTIONS = [
 # section is an error rather than silently ignored or appended.
 _SCALAR_SECTIONS = [
     "expected_es_version",
+    "expected_postgresql_status",
 ]
 
 _ALL_SECTIONS = _PATCH_SECTIONS + _SCALAR_SECTIONS

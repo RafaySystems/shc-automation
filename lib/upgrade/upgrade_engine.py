@@ -2,17 +2,18 @@
 lib/upgrade/upgrade_engine.py
 
 UPDATED (2026-08-12): patch-command sourcing moved fully to
-utils/helpers.py's load_canned_patch_commands() + config/patches/,
+utils/helpers.py's load_canned_patch_commands() + config/hops/,
 called from conftest.py -- NOT looked up inside this class. This engine
 just takes six plain command lists as constructor args and runs them at
-the right point. lib/upgrade/hops/ is not used by this file (superseded
-by config/patches/ -- see config/patches/README.md for the "add a new
-version pair" workflow). controller_type/src_version/dst_version are
+the right point. The OLD lib/upgrade/hops/ location is not used by this
+file (superseded by config/hops/ — see helpers.py's load_canned_patch_commands()
+docstring for the "add a new version pair" workflow: files are named
+{src}__to__{dst}.txt there). controller_type/src_version/dst_version are
 NOT needed by this class for lookup purposes -- src_version/dst_version
 remain cosmetic log labels only, matching the pre-hop-experiment design.
 
 Three of the six command lists are typically "canned (from
-config/patches/) + Jenkins textbox" merges, done by the CALLER
+config/hops/) + Jenkins textbox" merges, done by the CALLER
 (conftest.py) before construction -- this class doesn't know or care
 where a given list's commands came from, it just runs them in order:
   pre_commands, after_radm_dependency_commands, after_radm_application_commands
@@ -33,10 +34,12 @@ Phases, in the order they run:
   7.  wait elasticsearch       — wait for green
   8.  radm application         — always same, NEW package only
       after_radm_application_commands — from conftest.py (canned + Jenkins)
-  9.  post_commands            — canned only, right before radm cluster
-  10. radm cluster              — NEW package only (single pass)
+  9.  wait postgresql          — wait for STATUS == expected_postgresql_status
+                                  (default "Running")
+  10. post_commands            — canned only, right before radm cluster
+  11. radm cluster              — NEW package only (single pass)
       after_radm_cluster_commands — canned only, before final pod polling
-  11. final pod-health polling
+  12. final pod-health polling
 """
 
 import re
@@ -48,6 +51,7 @@ PHASE_WAIT = {
     "radm_application": {"interval": 20, "max_wait": 1000},
     "radm_cluster":     {"interval": 20, "max_wait": 800},
     "elasticsearch":    {"interval": 30, "max_wait": 1200},
+    "postgresql":       {"interval": 20, "max_wait": 600},
 }
 
 
@@ -68,6 +72,7 @@ class UpgradeEngine:
         post_commands: list = None,
         after_radm_cluster_commands: list = None,
         expected_es_version: str = None,
+        expected_postgresql_status: str = None,
     ):
         self.ssh         = ssh_client
         self.install_dir = install_dir
@@ -75,7 +80,7 @@ class UpgradeEngine:
         self.nsg         = nsg_manager
 
         # All six command lists are handed in as-is -- this class doesn't
-        # know or care whether a given list came from config/patches/,
+        # know or care whether a given list came from config/hops/,
         # a Jenkins textbox, both merged, or neither. See conftest.py's
         # controller_upgrade fixture for where that merging happens.
         self.pre_commands = pre_commands or []
@@ -84,6 +89,7 @@ class UpgradeEngine:
         self.config_patches = config_patches or []
         self.post_commands = post_commands or []
         self.expected_es_version = expected_es_version
+        self.expected_postgresql_status = expected_postgresql_status or "Running"
         self.after_radm_cluster_commands = after_radm_cluster_commands or []
 
         # Package name is JUST the URL's last path segment -- a plain
@@ -137,6 +143,8 @@ class UpgradeEngine:
         self._phase("radm_application", self._radm_application)
         self._run_commands("after_radm_application", self.after_radm_application_commands)
 
+        self._phase("wait_postgresql", lambda: self._wait_postgresql(self.expected_postgresql_status))
+
         self._run_commands("post", self.post_commands)
 
         self._phase("radm_cluster", self._radm_cluster)
@@ -158,13 +166,21 @@ class UpgradeEngine:
         except Exception as e:
             raise RuntimeError(f"Upgrade failed at [{name}]: {e}") from e
 
-    def _run_commands(self, cmd_type: str, commands: list):
+    def _run_commands(self, cmd_type: str, commands: list, cwd: str = None):
         """
         Warns on failure -- never stops the upgrade, matching how
         pre/post commands have always behaved in this engine (commands
         should end with `|| true` themselves if they're allowed to fail
         silently; this wrapper additionally never lets ANY single
         command's exception or non-zero exit abort the whole run).
+
+        cwd: if given, every command runs as `cd {cwd} && {cmd}` instead
+        of verbatim. The SSH client has no persistent working directory
+        between calls (every other phase in this file that touches
+        config.yaml does its own explicit `cd` for exactly this reason)
+        -- without this, a hop file's config_patches line referencing
+        `config.yaml` by a bare relative filename silently fails (or
+        edits nothing) because it never runs from the extract dir.
         """
         if not commands:
             print(f"[upgrade] No {cmd_type} commands to run")
@@ -173,8 +189,9 @@ class UpgradeEngine:
         for i, cmd in enumerate(commands, 1):
             label = cmd.strip()[:60] + ("..." if len(cmd.strip()) > 60 else "")
             print(f"[upgrade] [{i}/{len(commands)}] {label}")
+            run_cmd = f"cd {cwd} && {cmd}" if cwd else cmd
             try:
-                out, rc = self.ssh.run(cmd, timeout=120)
+                out, rc = self.ssh.run(run_cmd, timeout=120)
                 print(f"[upgrade] ✓" if rc == 0 else f"[upgrade] ⚠ WARNING (exit {rc}): {out[-150:]} — continuing")
             except Exception as e:
                 print(f"[upgrade] ⚠ WARNING: {e} — continuing")
@@ -233,11 +250,13 @@ class UpgradeEngine:
         self.ssh.run(f"sudo sed -i 's|archive-directory: RAFAY_PH|archive-directory: {self.dst_extract_dir}|' {new_config}")
         print(f"[create_upgrade_config] ✓ archive-directory: {self.dst_extract_dir}")
 
-        # Version-specific field edits from config/patches/.../config_patches.txt
-        # (if one exists for this src->dst pair), run against the NEW
-        # config.yaml right after it's created -- before any radm command
-        # reads it.
-        self._run_commands("config_patches", self.config_patches)
+        # Version-specific field edits from config/hops/<src>__to__<dst>.txt's
+        # [config_patches] section, run against the NEW config.yaml right
+        # after it's created -- before any radm command reads it. cwd=
+        # dst_extract_dir so a hop file's bare "config.yaml" (relative,
+        # matching the style already used in these files) resolves to the
+        # right one instead of silently failing.
+        self._run_commands("config_patches", self.config_patches, cwd=self.dst_extract_dir)
 
     def _copy_new_radm(self):
         out, rc = self.ssh.run(
@@ -307,6 +326,35 @@ class UpgradeEngine:
             time.sleep(cfg["interval"])
         print(f"[wait_elasticsearch] ⚠ Timeout after {cfg['max_wait']}s — continuing anyway")
 
+    def _wait_postgresql(self, expected_status: str = "Running"):
+        """
+        Waits for every `postgresql` custom resource (cluster-wide) to
+        report STATUS == expected_status (default "Running").
+
+        Simpler than _wait_elasticsearch: no per-resource-name filtering
+        (no known "legacy instance to ignore" pattern for postgresql the
+        way ES/Kibana has) and no version dimension — just every row's
+        last column must match.
+        """
+        cfg = PHASE_WAIT["postgresql"]
+        deadline = time.time() + cfg["max_wait"]
+        while time.time() < deadline:
+            out, rc = self.ssh.run(
+                "kubectl get postgresql -A --no-headers 2>/dev/null || echo NOT_READY"
+            )
+            if rc == 0 and "NOT_READY" not in out and out.strip():
+                rows = [l.split() for l in out.splitlines() if l.strip()]
+                not_ready = [r for r in rows if r[-1] != expected_status]
+                if not not_ready:
+                    print(f"[wait_postgresql] all {len(rows)} postgresql resource(s) {expected_status} ✓")
+                    return
+                names = [r[1] if len(r) > 1 else r[0] for r in not_ready]
+                print(f"[wait_postgresql] waiting on not-yet-{expected_status}: {names} ...")
+            else:
+                print("[wait_postgresql] no postgresql resources found yet ...")
+            time.sleep(cfg["interval"])
+        print(f"[wait_postgresql] ⚠ Timeout after {cfg['max_wait']}s — continuing anyway")
+
     def _radm_application(self):
         print("[radm_application] Running ...")
         out, rc = self.ssh.run(
@@ -321,7 +369,7 @@ class UpgradeEngine:
         Runs `radm cluster` only. Pod-health polling for this phase is
         deliberately NOT done here -- it runs separately in run(), after
         after_radm_cluster_commands, so a canned
-        config/patches/.../after_radm_cluster.txt (if one exists) gets to
+        config/hops/.../after_radm_cluster.txt (if one exists) gets to
         run before polling starts, not after.
         """
         print(f"[radm_cluster] Running from {self.dst_extract_dir} ...")
