@@ -148,7 +148,7 @@ class UpgradeEngine:
         self._run_commands("post", self.post_commands)
 
         self._phase("radm_cluster", self._radm_cluster)
-        self._run_commands("after_radm_cluster", self.after_radm_cluster_commands)
+        self._run_commands("after_radm_cluster", self.after_radm_cluster_commands, cwd=self.dst_extract_dir)
         self._phase("poll_after_radm_cluster",
                      lambda: self._poll_pods(PHASE_WAIT["radm_cluster"], "after radm cluster"))
 
