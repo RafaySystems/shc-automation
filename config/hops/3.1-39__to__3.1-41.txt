@@ -40,6 +40,10 @@ for pvc in keeper-storage-clickhouse-keeper-0 keeper-storage-clickhouse-keeper-1
 kubectl -n rafay-core get pvc -l 'app in (clickhouse,clickhouse-keeper)' -o custom-columns='NAME:.metadata.name,REQ:.spec.resources.requests.storage,CAP:.status.capacity.storage,PV:.spec.volumeName'
 kubectl -n rafay-core delete sts clickhouse clickhouse-keeper --cascade=orphan
 
+#Patch the frontend logo
+kubectl -n rafay-core annotate configmap frontend-logo meta.helm.sh/release-name=rafay-core meta.helm.sh/release-namespace=rafay-core --overwrite
+kubectl -n rafay-core label configmap frontend-logo app.kubernetes.io/managed-by=Helm --overwrite
+
 [after_radm_dependency]
 #Restart statefulsets
 kubectl rollout restart statefulset -n rafay-core
@@ -55,10 +59,6 @@ sed -i '/cluster-images-archive:/,/file:/ s|file:.*|file: rafay-cluster-images-m
 [expected_es_version]
 9.4.4
 
-#Patch the frontend logo
-kubectl -n rafay-core annotate configmap frontend-logo meta.helm.sh/release-name=rafay-core meta.helm.sh/release-namespace=rafay-core --overwrite
-kubectl -n rafay-core label configmap frontend-logo app.kubernetes.io/managed-by=Helm --overwrite
-
 [expected_postgresql_status]
 Running
 
@@ -68,5 +68,3 @@ kubectl set env deployment/paas-api WORKSPACE_API_ALLOW_DAY2_OPERATIONS=true -n 
 
 [after_radm_cluster]
 sudo aria2c -x 16 -s 16 -d /opt/rafay/rafay-airgapped-controller-v3.1-41 https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/3.1/rafay-cluster-images-multiarch-v3.1-41.tar.gz
-
-
