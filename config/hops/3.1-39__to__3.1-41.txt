@@ -56,6 +56,14 @@ kubectl scale sts -n rafay-core clickhouse clickhouse-keeper --replicas=0
 sleep 60 && kubectl scale sts -n rafay-core clickhouse --replicas=2
 kubectl scale sts -n rafay-core clickhouse-keeper --replicas=3
 
+#Delete and Recreate BackupRepository Resources (Velero v1.15.x → v1.18.x Upgrade)
+kubectl get backuprepositories -A
+kubectl delete backuprepositories.velero.io -n velero --all
+kubectl rollout restart deployment velero -n velero
+kubectl rollout restart daemonset node-agent -n velero
+kubectl get pods -n velero
+
+
 [config_patches]
 sed -i '/cluster-images-archive:/,/file:/ s|file:.*|file: rafay-cluster-images-multiarch-v3.1-41.tar.gz|' config.yaml
 
