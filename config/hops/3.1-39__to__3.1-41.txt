@@ -6,6 +6,11 @@ sudo rm -rf /tmp/radm.log /tmp/rafay-dep* /tmp/rafay-cluster* /tmp/rafay-core* /
 # Install pigz for faster extraction
 sudo apt-get -o Acquire::ForceIPv4=true install -y pigz 2>&1 || true
 
+#Install helm on node -- MUST run before any helm command below (uninstall included)
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+sudo ln -sf /usr/local/bin/helm /usr/bin/helm
+/usr/bin/helm version
+
 #remove default storage class
 kubectl patch storageclass openebs-hostpath --type=json -p='[{"op":"remove","path":"/metadata/annotations/storageclass.kubernetes.io~1is-default-class"}]'
 
@@ -27,11 +32,6 @@ kubectl delete sts -n rafay-core rafay-tsdb
 kubectl delete pvc -n rafay-core storage-volume-rafay-tsdb-0 storage-volume-rafay-tsdb-1 wal-volume-rafay-tsdb-0 wal-volume-rafay-tsdb-1 storage-volume-rafay-tsdb-2 wal-volume-rafay-tsdb-2
 kubectl delete svc -n rafay-core rafay-tsdb rafay-tsdb-config rafay-tsdb-replica
 kubectl delete ep -n rafay-core rafay-tsdb rafay-tsdb-config rafay-tsdb-replica
-
-#Install helm on node
-curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-sudo ln -sf /usr/local/bin/helm /usr/bin/helm
-/usr/bin/helm version
 
 #Patch the clickhouse
 kubectl -n rafay-core get sts clickhouse clickhouse-keeper -o custom-columns='NAME:.metadata.name,VCT:.spec.volumeClaimTemplates[*].metadata.name,SIZE:.spec.volumeClaimTemplates[*].spec.resources.requests.storage,PVCPOLICY:.spec.persistentVolumeClaimRetentionPolicy,SC:.spec.volumeClaimTemplates[*].spec.storageClassName'
