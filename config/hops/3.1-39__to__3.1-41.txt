@@ -21,6 +21,7 @@ kubectl annotate deploy redis-master -n rafay-core meta.helm.sh/release-name=red
 kubectl delete $(kubectl api-resources --verbs=list --namespaced -o name | tr '\n' ',' | sed 's/,$//') -l app.kubernetes.io/part-of=kube-prometheus-stack -n rafay-core
 
 #Delete all the rafay-tsdb related entries
+helm uninstall -n rafay-core promscale rafay-tsdb promscale-read
 kubectl delete secrets -n rafay-core rafay-tsdb-certificate rafay-tsdb-credentials rafay-tsdb-pgbackrest
 kubectl delete sts -n rafay-core rafay-tsdb
 kubectl delete pvc -n rafay-core storage-volume-rafay-tsdb-0 storage-volume-rafay-tsdb-1 wal-volume-rafay-tsdb-0 wal-volume-rafay-tsdb-1 storage-volume-rafay-tsdb-2 wal-volume-rafay-tsdb-2
