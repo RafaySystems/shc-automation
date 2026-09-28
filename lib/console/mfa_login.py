@@ -6,6 +6,7 @@ Handles both first-run (QR scan) and subsequent runs (saved secret).
 Includes OTP retry logic to handle TOTP window timing issues.
 """
 
+import re
 import urllib.parse
 import base64
 import io
@@ -19,10 +20,10 @@ class LoginResult:
     success:      bool
     url:          str
     secret:       str
-    screenshot:   bytes
+    screenshot:   bytes = field(repr=False)
     dashboard:    dict = field(default_factory=dict)
     error:        str = ""
-    qr_screenshot: bytes = b""
+    qr_screenshot: bytes = field(default=b"", repr=False)
     mfa_type:     str = ""
 
 
@@ -102,32 +103,9 @@ class ConsoleLogin:
         print(f"[console_login] Page URL: {page.url}")
         print(f"[console_login] Page title: {page.title()}")
 
-        # Step 1: Email
+        # Step 1+2: Email + password (handles single-form and two-step pages)
         print("[console_login] Entering email ...")
-        email_input = page.locator(
-            "input[type='email'], "
-            "input[name*='email'], "
-            "input[placeholder*='email' i], "
-            "input[placeholder*='username' i], "
-            "input[autocomplete='email'], "
-            "input[autocomplete='username']"
-        ).first
-        email_input.wait_for(state="visible", timeout=30000)
-        email_input.fill(self.email)
-        page.keyboard.press("Enter")
-
-        # Step 2: Password
-        print("[console_login] Entering password ...")
-        pwd_input = page.locator("input[type='password']").first
-        pwd_input.wait_for(state="visible", timeout=15000)
-        pwd_input.fill(self.password)
-
-        submit = page.locator("button[type='submit']")
-        if submit.count() == 0:
-            submit = page.locator("button").filter(has_text="Login").or_(
-                     page.locator("button").filter(has_text="Sign in")).or_(
-                     page.locator("button").filter(has_text="Continue"))
-        submit.first.click()
+        self._submit_credentials(page)
 
         # Step 3: MFA page
         print("[console_login] Waiting for MFA page ...")
@@ -249,25 +227,7 @@ class ConsoleLogin:
                     page.goto(self.url, wait_until="networkidle")
                     time.sleep(3)
 
-                    # Email — try multiple selectors
-                    email_loc = page.locator(
-                        "input[type='email'], input[name*='email'], "
-                        "input[placeholder*='email' i], input[placeholder*='username' i]"
-                    ).first
-                    email_loc.wait_for(state="visible", timeout=20000)
-                    email_loc.fill(self.email)
-                    page.keyboard.press("Enter")
-
-                    # Password
-                    pwd_loc = page.locator("input[type='password']").first
-                    pwd_loc.wait_for(state="visible", timeout=10000)
-                    pwd_loc.fill(self.password)
-
-                    # Submit
-                    submit = page.locator("button[type='submit']")
-                    if submit.count() == 0:
-                        submit = page.locator("button:visible").first
-                    submit.first.click()
+                    self._submit_credentials(page)
 
                     # Wait for MFA page
                     page.wait_for_selector(
@@ -280,6 +240,77 @@ class ConsoleLogin:
                         f"The secret in dev.yaml may be incorrect for this controller.\n"
                         f"Try resetting MFA or passing --mfa-secret with the correct secret."
                     )
+
+    _EMAIL_SELECTOR = (
+        "input[type='email'], "
+        "input[name*='email'], "
+        "input[placeholder*='email' i], "
+        "input[placeholder*='username' i], "
+        "input[autocomplete='email'], "
+        "input[autocomplete='username']"
+    )
+    # Matches the login form's submit control by accessible name, whatever
+    # the element is (<button>, <input type=submit>, role=button) and whatever
+    # the casing ("Sign In", "Login", ...). Anchored so it can't match
+    # "Forgot your password" or the password show/hide toggle.
+    _SIGNIN_NAME = re.compile(r"^\s*(sign\s*in|log\s*in|login|continue|next)\s*$", re.I)
+    _MFA_SELECTOR = "input[name='verify_token'], input[placeholder='Enter 6-digit code']"
+
+    def _submit_credentials(self, page):
+        """
+        Fill email + password and submit, for BOTH login page layouts:
+          - single form (4.3 UI): email and password on one page
+          - two-step (older UI): email first, password appears after Enter
+
+        The old code always pressed Enter after the email. On the single-form
+        page that submits the form with an EMPTY password, so the controller
+        answers AUTH002 "Could not validate your account" (the toast in the
+        build #164 screenshot) -- then the password gets typed afterwards,
+        which is why the screenshot showed both fields filled.
+        """
+        email_input = page.locator(self._EMAIL_SELECTOR).first
+        email_input.wait_for(state="visible", timeout=30000)
+        email_input.fill(self.email)
+
+        pwd_input = page.locator("input[type='password']").first
+        try:
+            pwd_input.wait_for(state="visible", timeout=3000)
+            print("[console_login] Single-form login page (email + password together)")
+        except Exception:
+            print("[console_login] Two-step login page — submitting email first ...")
+            email_input.press("Enter")
+            pwd_input.wait_for(state="visible", timeout=15000)
+
+        print("[console_login] Entering password ...")
+        pwd_input.fill(self.password)
+
+        submit = page.get_by_role("button", name=self._SIGNIN_NAME)
+        if submit.count() > 0:
+            submit.first.click()
+        else:
+            print("[console_login] No Sign In button matched — submitting with Enter")
+            pwd_input.press("Enter")
+
+        self._raise_if_login_rejected(page)
+
+    def _raise_if_login_rejected(self, page, timeout: int = 15):
+        """
+        After submitting credentials, wait until one of: MFA page appears,
+        we leave the login page, or the controller shows its rejection toast.
+        On rejection, raise with the controller's own message immediately
+        instead of timing out 30s later on an unrelated locator.
+        """
+        deadline = time.time() + timeout
+        rejected = page.get_by_text(re.compile(r"could not validate|invalid (credentials|password)", re.I))
+        while time.time() < deadline:
+            if page.locator(self._MFA_SELECTOR).count() > 0:
+                return
+            if "login" not in page.url:
+                return
+            if rejected.count() > 0:
+                msg = rejected.first.inner_text().strip()
+                raise RuntimeError(f"Controller rejected the login: {msg}")
+            time.sleep(0.5)
 
     def _detect_mfa_page(self, page) -> str:
         has_canvas   = page.locator("canvas").count() > 0
