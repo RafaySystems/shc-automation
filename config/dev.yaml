@@ -1,6 +1,6 @@
 console:
   email: admin@rafay.co
-  mfa_secret: 75WHXPLUJFTNOIWO
+  mfa_secret: ""
   partner_id: 4qkolkn
   password: change123
   test_org:
@@ -12,7 +12,7 @@ console:
 controller:
   controller_size: S
   ha: true
-  ip: 129.153.120.157
+  ip: 132.226.27.184
   ssh_key: /Users/vijay/Documents/rafay-pytest-framework/keys/oci.key
   os_type: ubuntu24
   provision: false

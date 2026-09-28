@@ -187,7 +187,7 @@ class ConsoleLogin:
                 "input[placeholder='Enter 6-digit code']"
             ).first
             otp_input.fill(otp_code)
-            self._click_submit(page)
+            self._click_submit(page, fallback_input=otp_input)
 
             # Check if we navigated to dashboard (success)
             try:
@@ -368,12 +368,26 @@ class ConsoleLogin:
             raise ValueError(f"No secret found in OTP URI: {uri}")
         return secret
 
-    def _click_submit(self, page):
+    def _click_submit(self, page, fallback_input=None):
+        """
+        Submit the MFA form. Tries a button by accessible name first; if the
+        page has no matching button element, presses Enter in the OTP input.
+
+        The 4.3 ops-console renders its actions without a button role -- the
+        login page's Sign In matched no button either (build #166 log:
+        "No Sign In button matched — submitting with Enter", which then
+        worked) and the MFA page failed with "Could not find submit button".
+        Enter submits the form the same way a click would.
+        """
         for label in ["Verify Token", "Verify", "Submit", "Confirm", "Continue", "Sign in"]:
             btn = page.get_by_role("button", name=label, exact=False)
             if btn.count() > 0:
                 btn.first.click()
                 return
+        if fallback_input is not None:
+            print("[console_login] No MFA submit button matched — submitting with Enter")
+            fallback_input.press("Enter")
+            return
         all_buttons = page.locator("button:visible")
         if all_buttons.count() > 0:
             all_buttons.first.click()
