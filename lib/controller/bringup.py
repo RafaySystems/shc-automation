@@ -18,7 +18,7 @@ Flow:
     10. setup_secondary_nodes()— HA only: repeat steps 3-9 on node2+node3,
                                  IN PARALLEL (ThreadPoolExecutor, one worker
                                  per secondary node)
-    11. radm_init()            — radm init + kubeconfig + HA join
+    11. radm_init()            — radm init (--skip-preflight when supported) + kubeconfig + HA join
                                  → polls node Ready every 30s for 5 min
     12. radm_dependency()      — radm dependency
                                  → command timeout 1800s (30 min)
@@ -720,11 +720,19 @@ class ControllerBringup:
         )
         self.ssh.run("sudo systemctl restart containerd && sleep 5", timeout=30)
 
-        print("[radm_init] Running radm init ...")
-        out, rc = self.ssh.run(
-            f"cd {self.extract_dir} && sudo ./radm init --config config.yaml 2>&1",
-            timeout=1800,
+        # radm 4.3+ runs preflight by default and aborts in non-interactive
+        # (no-TTY) sessions like ours. Pass --skip-preflight whenever this
+        # radm build supports it; older builds without the flag are unaffected.
+        help_out, _ = self.ssh.run(
+            f"cd {self.extract_dir} && sudo ./radm init --help 2>&1", timeout=30
         )
+        init_flags = "--skip-preflight" if "--skip-preflight" in help_out else ""
+        if init_flags:
+            print("[radm_init] WARNING: radm preflight checks are being skipped (--skip-preflight)")
+
+        cmd = f"cd {self.extract_dir} && sudo ./radm init {init_flags} --config config.yaml 2>&1"
+        print(f"[radm_init] Running radm init ...\n[radm_init] $ {cmd}")
+        out, rc = self.ssh.run(cmd, timeout=1800)
         assert rc == 0, f"radm init failed (exit {rc}): {out[-500:]}"
         print("[radm_init] radm init complete ✓")
 
