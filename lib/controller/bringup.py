@@ -18,7 +18,7 @@ Flow:
     10. setup_secondary_nodes()— HA only: repeat steps 3-9 on node2+node3,
                                  IN PARALLEL (ThreadPoolExecutor, one worker
                                  per secondary node)
-    11. radm_init()            — radm init (--skip-preflight when supported) + kubeconfig + HA join
+    11. radm_init()            — radm init + kubeconfig + HA join
                                  → polls node Ready every 30s for 5 min
     12. radm_dependency()      — radm dependency
                                  → command timeout 1800s (30 min)
@@ -29,6 +29,11 @@ Flow:
     14. radm_cluster()         — radm cluster (streaming output, 3-retry on 502)
                                  → command timeout 2400s (40 min)
                                  → polls pods every 20s for 15 min
+
+All radm subcommands (init, join, dependency, application, cluster) get
+--skip-preflight appended automatically when that subcommand's --help lists
+it -- see _radm_flags(). radm 4.3+ otherwise aborts preflight in our
+non-interactive SSH sessions.
 
 Jenkins params:
     --controller-size   S | M | L | POC
@@ -704,6 +709,41 @@ class ControllerBringup:
         finally:
             sec_ssh.disconnect()
 
+    # radm flags that are passed to a subcommand ONLY if that subcommand's own
+    # --help lists them. radm 4.3+ runs preflight by default and aborts in
+    # non-interactive (no-TTY) sessions like ours; older builds either lack
+    # the flag or default it to true, so they are unaffected.
+    RADM_OPTIONAL_FLAGS = ("--skip-preflight",)
+
+    def _radm_flags(self, subcommand: str) -> str:
+        """
+        Return the optional flags (RADM_OPTIONAL_FLAGS) supported by
+        `radm <subcommand>` in this package, e.g. "--skip-preflight" or "".
+
+        Detected from `radm <subcommand> --help` on node1 and cached per
+        subcommand, so each help call runs once per bringup. Secondary nodes
+        run the same radm binary (same package), so node1's answer applies
+        to them too. Never raises -- on any error, returns "" (no extra flags).
+        """
+        cache = self.__dict__.setdefault("_radm_flag_cache", {})
+        if subcommand in cache:
+            return cache[subcommand]
+        try:
+            help_out, _ = self.ssh.run(
+                f"cd {self.extract_dir} && sudo ./radm {subcommand} --help 2>&1", timeout=30
+            )
+        except Exception as e:
+            print(f"[radm_flags] `radm {subcommand} --help` failed ({e}) — using no optional flags")
+            help_out = ""
+        supported = [f for f in self.RADM_OPTIONAL_FLAGS if f in help_out]
+        cache[subcommand] = " ".join(supported)
+        if supported:
+            print(f"[radm_flags] WARNING: `radm {subcommand}` will run with {cache[subcommand]} "
+                  f"(preflight checks skipped)")
+        else:
+            print(f"[radm_flags] `radm {subcommand}`: no optional flags supported — running as-is")
+        return cache[subcommand]
+
     def _radm_init(self):
         """radm init on node1, kubeconfig setup, HA join on node2+3."""
         self.ssh.run("sudo systemctl stop consul kubelet 2>/dev/null || true && sleep 2", timeout=15)
@@ -720,16 +760,7 @@ class ControllerBringup:
         )
         self.ssh.run("sudo systemctl restart containerd && sleep 5", timeout=30)
 
-        # radm 4.3+ runs preflight by default and aborts in non-interactive
-        # (no-TTY) sessions like ours. Pass --skip-preflight whenever this
-        # radm build supports it; older builds without the flag are unaffected.
-        help_out, _ = self.ssh.run(
-            f"cd {self.extract_dir} && sudo ./radm init --help 2>&1", timeout=30
-        )
-        init_flags = "--skip-preflight" if "--skip-preflight" in help_out else ""
-        if init_flags:
-            print("[radm_init] WARNING: radm preflight checks are being skipped (--skip-preflight)")
-
+        init_flags = self._radm_flags("init")
         cmd = f"cd {self.extract_dir} && sudo ./radm init {init_flags} --config config.yaml 2>&1"
         print(f"[radm_init] Running radm init ...\n[radm_init] $ {cmd}")
         out, rc = self.ssh.run(cmd, timeout=1800)
@@ -826,11 +857,13 @@ class ControllerBringup:
         """
         pri_ip, token, ca_hash, cert_key = self._parse_ha_join_from_output(radm_init_output)
 
+        join_flags = self._radm_flags("join")
         join_cmd = (
-            f"cd {self.extract_dir} && sudo ./radm join {pri_ip}:6443 "
+            f"cd {self.extract_dir} && sudo ./radm join {join_flags} {pri_ip}:6443 "
             f"--token {token} --discovery-token-ca-cert-hash sha256:{ca_hash} "
             f"--control-plane --certificate-key {cert_key} --config config.yaml"
         )
+        print(f"[ha_join] $ {join_cmd}")
 
         print("[ha_join] Waiting 60s for etcd to stabilize ...")
         time.sleep(60)
@@ -903,11 +936,10 @@ class ControllerBringup:
         was observed still actively creating Helm resources for istio-services
         and rafay-es when a previous 600s timeout fired mid-apply).
         """
-        print("[radm_dependency] Running radm dependency ...")
-        out, rc = self.ssh.run(
-            f"cd {self.extract_dir} && sudo ./radm dependency --config config.yaml 2>&1",
-            timeout=1800,
-        )
+        dep_flags = self._radm_flags("dependency")
+        cmd = f"cd {self.extract_dir} && sudo ./radm dependency {dep_flags} --config config.yaml 2>&1"
+        print(f"[radm_dependency] Running radm dependency ...\n[radm_dependency] $ {cmd}")
+        out, rc = self.ssh.run(cmd, timeout=1800)
         assert rc == 0, f"radm dependency failed (exit {rc}): {out[-300:]}"
         print("[radm_dependency] complete ✓ — polling pods ...")
         self._poll_pods_running(
@@ -917,11 +949,10 @@ class ControllerBringup:
         )
 
     def _radm_application(self):
-        print("[radm_application] Running radm application ...")
-        out, rc = self.ssh.run(
-            f"cd {self.extract_dir} && sudo ./radm application --config config.yaml 2>&1",
-            timeout=2400,
-        )
+        app_flags = self._radm_flags("application")
+        cmd = f"cd {self.extract_dir} && sudo ./radm application {app_flags} --config config.yaml 2>&1"
+        print(f"[radm_application] Running radm application ...\n[radm_application] $ {cmd}")
+        out, rc = self.ssh.run(cmd, timeout=2400)
         assert rc == 0, f"radm application failed (exit {rc}): {out[-300:]}"
         print("[radm_application] complete ✓ — polling pods ...")
         self._poll_pods_running(
@@ -956,11 +987,14 @@ class ControllerBringup:
         """
         max_retries = 3
         retry_wait  = 60
+        cluster_flags = self._radm_flags("cluster")
+        cmd = f"cd {self.extract_dir} && sudo ./radm cluster {cluster_flags} --config config.yaml 2>&1"
+        print(f"[radm_cluster] $ {cmd}")
 
         for attempt in range(1, max_retries + 1):
             print(f"[radm_cluster] attempt {attempt}/{max_retries} ...")
             out, rc = self.ssh.run_stream(
-                f"cd {self.extract_dir} && sudo ./radm cluster --config config.yaml 2>&1",
+                cmd,
                 timeout=2400,
                 prefix="[radm cluster]",
             )
