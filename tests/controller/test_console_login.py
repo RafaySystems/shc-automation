@@ -200,63 +200,18 @@ def _browser_login_and_screenshot(url: str, email: str, password: str) -> tuple:
     Login to a Rafay console URL via playwright browser.
     Returns: (screenshot_bytes, dashboard_url)
     No MFA expected for newly created org users.
+
+    Delegates to lib.console.mfa_login.browser_login, which shares
+    ConsoleLogin's credential handling (3.x two-step forms with submit
+    buttons, 4.x single form with a link-styled "Sign In"). The old inline
+    version pressed Enter after the email -- on 4.x that submits an empty
+    password -- and clicked button[type=submit], which 4.x doesn't have.
     """
-    from playwright.sync_api import sync_playwright
+    from lib.console.mfa_login import browser_login
 
-    screenshot_bytes = None
-    dashboard_url    = ""
-
-    pw      = sync_playwright().start()
-    browser = pw.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage"]
-    )
-    ctx  = browser.new_context(
-        ignore_https_errors=True,
-        viewport={"width": 1920, "height": 1080}
-    )
-    page = ctx.new_page()
-
-    try:
-        print(f"[browser_login] Navigating to {url} ...")
-        page.goto(url + "/", wait_until="networkidle")
-        time.sleep(2)
-
-        # Email
-        email_loc = page.locator(
-            "input[type='email'], input[name*='email'], "
-            "input[placeholder*='email' i], input[placeholder*='username' i]"
-        ).first
-        email_loc.wait_for(state="visible", timeout=15000)
-        email_loc.fill(email)
-        page.keyboard.press("Enter")
-        print(f"[browser_login] Email: {email}")
-
-        # Password
-        page.locator("input[type='password']").first.wait_for(state="visible", timeout=10000)
-        page.locator("input[type='password']").first.fill(password)
-        page.locator("button[type='submit']").first.click()
-        print(f"[browser_login] Password entered")
-
-        # Wait for dashboard
-        page.wait_for_url(
-            lambda u: "login" not in u and "mfa" not in u,
-            timeout=15000
-        )
-        time.sleep(2)
-
-        dashboard_url    = page.url
-        screenshot_bytes = page.screenshot(full_page=False)
+    screenshot_bytes, dashboard_url, error = browser_login(url, email, password)
+    if not error:
         print(f"[browser_login] ✓ Dashboard: {dashboard_url} ({len(screenshot_bytes)} bytes)")
-
-    except Exception as e:
-        print(f"[browser_login] Error: {e}")
-        screenshot_bytes = page.screenshot(full_page=False)
-        dashboard_url    = page.url
-    finally:
-        browser.close()
-        pw.stop()
-
     return screenshot_bytes, dashboard_url
 
 
@@ -264,11 +219,17 @@ def _get_authenticated_session(ops_url: str, email: str,
                                 password: str, mfa_secret: str,
                                 extras: list = None, request=None) -> tuple:
     """
-    Login to ops-console via playwright to get csrftoken + authenticated cookies.
+    Login to ops-console to get csrftoken + authenticated cookies.
     Returns: (csrftoken, requests.Session)
+
+    Uses the cookies from ConsoleLogin's own (single) login. The old version
+    logged in a second time with separate playwright code that broke on 4.x
+    (Enter after email -> AUTH002, no button[type=submit]) and, on a fresh
+    controller, re-used the pre-enrollment secret instead of the new one --
+    every one of those failed attempts also counts toward the controller's
+    lockout (AUTH079).
     """
     from lib.console.mfa_login import ConsoleLogin
-    from playwright.sync_api import sync_playwright
 
     print(f"[auth_session] Logging in to get CSRF cookies ...")
     console = ConsoleLogin(url=ops_url, email=email,
@@ -281,58 +242,10 @@ def _get_authenticated_session(ops_url: str, email: str,
     if not result.success:
         raise RuntimeError(f"Admin login failed: {result.error}")
 
-    # Re-login via playwright to grab all cookies including csrftoken
-    pw      = sync_playwright().start()
-    browser = pw.chromium.launch(
-        headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
-    )
-    ctx  = browser.new_context(ignore_https_errors=True)
-    page = ctx.new_page()
-
-    try:
-        page.goto(ops_url + "/", wait_until="networkidle")
-
-        email_loc = page.locator(
-            "input[type='email'], input[name*='email'], input[placeholder*='email' i]"
-        ).first
-        email_loc.wait_for(state="visible", timeout=15000)
-        email_loc.fill(email)
-        page.keyboard.press("Enter")
-
-        page.locator("input[type='password']").first.wait_for(state="visible", timeout=10000)
-        page.locator("input[type='password']").first.fill(password)
-        page.locator("button[type='submit']").first.click()
-
-        # Handle MFA
-        try:
-            page.wait_for_selector(
-                "input[name='verify_token'], input[placeholder='Enter 6-digit code']",
-                timeout=10000
-            )
-            if mfa_secret:
-                import pyotp
-                totp = pyotp.TOTP(mfa_secret)
-                remaining = totp.interval - (int(time.time()) % totp.interval)
-                if remaining < 5:
-                    time.sleep(remaining + 1)
-                page.locator(
-                    "input[name='verify_token'], input[placeholder='Enter 6-digit code']"
-                ).first.fill(totp.now())
-                page.locator("button:visible").first.click()
-        except Exception:
-            pass
-
-        page.wait_for_url(lambda u: "login" not in u, timeout=15000)
-        time.sleep(2)
-
-        all_cookies = {c["name"]: c["value"] for c in ctx.cookies()}
-        csrftoken   = all_cookies.get("csrftoken", "")
-        print(f"[auth_session] cookies: {list(all_cookies.keys())}")
-        print(f"[auth_session] csrftoken: {csrftoken[:10]}..." if csrftoken else "[auth_session] csrftoken: EMPTY")
-
-    finally:
-        browser.close()
-        pw.stop()
+    all_cookies = dict(result.cookies)
+    csrftoken   = all_cookies.get("csrftoken", "")
+    print(f"[auth_session] cookies: {list(all_cookies.keys())}")
+    print(f"[auth_session] csrftoken: {csrftoken[:10]}..." if csrftoken else "[auth_session] csrftoken: EMPTY")
 
     session = requests.Session()
     session.verify = False

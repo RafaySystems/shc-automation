@@ -25,6 +25,44 @@ class LoginResult:
     error:        str = ""
     qr_screenshot: bytes = field(default=b"", repr=False)
     mfa_type:     str = ""
+    # Browser cookies after a successful login (csrftoken, session, ...), so
+    # callers can build an API session without logging in a second time.
+    cookies:      dict = field(default_factory=dict, repr=False)
+
+
+def browser_login(url: str, email: str, password: str, prefix: str = "[browser_login]"):
+    """
+    Log in to a Rafay console (no MFA expected, e.g. a new org user) and
+    screenshot the landing page. Uses the same credential handling as
+    ConsoleLogin, so it works on both 3.x (two-step, submit buttons) and
+    4.x (single form, link-styled Sign In).
+
+    Returns (screenshot_bytes, landing_url, error_or_empty).
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True,
+                                    args=["--no-sandbox", "--disable-dev-shm-usage"])
+        ctx  = browser.new_context(ignore_https_errors=True,
+                                   viewport={"width": 1920, "height": 1080})
+        page = ctx.new_page()
+        error = ""
+        try:
+            print(f"{prefix} Navigating to {url} ...")
+            page.goto(url.rstrip("/") + "/", wait_until="networkidle")
+            time.sleep(2)
+            ConsoleLogin(url=url, email=email, password=password)._submit_credentials(page)
+            page.wait_for_url(lambda u: "login" not in u and "mfa" not in u, timeout=15000)
+            time.sleep(2)
+            print(f"{prefix} ✓ Landed on {page.url}")
+        except Exception as e:
+            error = str(e)
+            print(f"{prefix} Error: {e}")
+        shot = page.screenshot(full_page=False)
+        landing = page.url
+        browser.close()
+    return shot, landing, error
 
 
 class ConsoleLogin:
@@ -76,6 +114,7 @@ class ConsoleLogin:
                     dashboard=dashboard,
                     qr_screenshot=self._qr_bytes,
                     mfa_type=self._mfa_type,
+                    cookies={c["name"]: c["value"] for c in context.cookies()},
                 )
             except Exception as e:
                 screenshot = page.screenshot(full_page=False)
