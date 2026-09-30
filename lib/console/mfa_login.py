@@ -62,6 +62,7 @@ class ConsoleLogin:
                 viewport={"width": 1920, "height": 1080}
             )
             page = context.new_page()
+            self._attach_auth_logger(page)
 
             try:
                 secret    = self._do_login(page)
@@ -110,7 +111,7 @@ class ConsoleLogin:
         # Step 3: MFA page
         print("[console_login] Waiting for MFA page ...")
         page.wait_for_selector(
-            "input[name='verify_token'], input[placeholder='Enter 6-digit code']",
+            "input[name='verify_token'], input[placeholder='Enter 6-digit code'], input[name='totp'], input[name*='otp' i]",
             timeout=15000
         )
 
@@ -122,16 +123,14 @@ class ConsoleLogin:
 
         if mfa_type == "enrollment" and not secret:
             # First run — scan QR and extract secret
-            secret = self._scan_qr(page)
-            print(f"[console_login] TOTP secret extracted from QR: {secret}")
+            secret = self._enrollment_secret(page)
 
         elif mfa_type == "enrollment" and secret:
             # Secret provided but enrollment page shown — controller re-brough up
             # Old secret is stale — scan fresh QR instead
             print(f"[console_login] Enrollment page shown but secret exists "
                   f"— controller may have been re-deployed, scanning fresh QR ...")
-            secret = self._scan_qr(page)
-            print(f"[console_login] Fresh TOTP secret extracted: {secret}")
+            secret = self._enrollment_secret(page)
 
         elif mfa_type == "otp" and not secret:
             # OTP page + no secret — check if QR is hidden in page
@@ -182,11 +181,15 @@ class ConsoleLogin:
                   f"(~{totp.interval - (int(time.time()) % totp.interval)}s remaining)")
 
             # Fill OTP input
-            otp_input = page.locator(
-                "input[name='verify_token'], "
-                "input[placeholder='Enter 6-digit code']"
-            ).first
+            # Only a VISIBLE OTP field -- a hidden input matching the same
+            # selector would take the code while the real field stays empty.
+            otp_input = page.locator(", ".join(
+                f"{sel.strip()}:visible" for sel in self._MFA_SELECTOR.split(",")
+            )).first
             otp_input.fill(otp_code)
+            print(f"[console_login] OTP field: name={otp_input.get_attribute('name')!r} "
+                  f"value now={otp_input.input_value()!r}")
+            seen = len(self._auth_log)
             self._click_submit(page, fallback_input=otp_input)
 
             # Check if we navigated to dashboard (success)
@@ -199,7 +202,21 @@ class ConsoleLogin:
                 return secret
 
             except Exception:
-                # Still on login/mfa page
+                # Still on login/mfa page -- show what the controller answered
+                self._print_auth_log_since(seen, attempt)
+                last = " ".join(self._auth_log[seen:])
+                if "AUTH079" in last:
+                    raise RuntimeError(
+                        "Admin account is LOCKED OUT (AUTH079: too many incorrect attempts) — "
+                        "wait 15 minutes before retrying. Stopped to avoid extending the lockout.")
+                if "AUTH002" in last and attempt >= 2:
+                    # Code was generated at the start of a fresh window and actually
+                    # submitted, and rejected twice: the secret is wrong. More
+                    # attempts only trigger the controller's lockout (AUTH079).
+                    raise RuntimeError(
+                        f"OTP rejected twice (AUTH002) with the code actually submitted — the TOTP "
+                        f"secret {secret} does not match this controller's enrollment. "
+                        f"Stopped before the account gets locked out.")
                 if attempt < max_attempts:
                     print(f"[console_login] ⚠ OTP attempt {attempt} failed "
                           f"— waiting for next TOTP window ...")
@@ -214,7 +231,7 @@ class ConsoleLogin:
 
                     # Check if MFA input is still visible — reuse it
                     mfa_still_visible = page.locator(
-                        "input[name='verify_token'], input[placeholder='Enter 6-digit code']"
+                        "input[name='verify_token'], input[placeholder='Enter 6-digit code'], input[name='totp'], input[name*='otp' i]"
                     ).count() > 0
 
                     if mfa_still_visible:
@@ -231,10 +248,11 @@ class ConsoleLogin:
 
                     # Wait for MFA page
                     page.wait_for_selector(
-                        "input[name='verify_token'], input[placeholder='Enter 6-digit code']",
+                        "input[name='verify_token'], input[placeholder='Enter 6-digit code'], input[name='totp'], input[name*='otp' i]",
                         timeout=15000
                     )
                 else:
+                    self._dump_mfa_controls(page)
                     raise RuntimeError(
                         f"MFA login failed after {max_attempts} OTP attempts.\n"
                         f"The secret in dev.yaml may be incorrect for this controller.\n"
@@ -254,7 +272,22 @@ class ConsoleLogin:
     # the casing ("Sign In", "Login", ...). Anchored so it can't match
     # "Forgot your password" or the password show/hide toggle.
     _SIGNIN_NAME = re.compile(r"^\s*(sign\s*in|log\s*in|login|continue|next)\s*$", re.I)
-    _MFA_SELECTOR = "input[name='verify_token'], input[placeholder='Enter 6-digit code']"
+    _MFA_SELECTOR = "input[name='verify_token'], input[placeholder='Enter 6-digit code'], input[name='totp'], input[name*='otp' i]"
+
+    @staticmethod
+    def _find_action(page, name):
+        """
+        First visible control with this accessible name, as a button OR a
+        link. The 4.3 ops-console renders its actions as links -- Playwright
+        codegen on shc-168: get_by_role("link", name="Sign In") and
+        get_by_role("link", name="Continue") -- so button-only lookups found
+        nothing and the OTP was never submitted.
+        """
+        for role in ("button", "link"):
+            loc = page.get_by_role(role, name=name)
+            if loc.count() > 0:
+                return loc.first
+        return None
 
     def _submit_credentials(self, page):
         """
@@ -284,9 +317,13 @@ class ConsoleLogin:
         print("[console_login] Entering password ...")
         pwd_input.fill(self.password)
 
-        submit = page.get_by_role("button", name=self._SIGNIN_NAME)
-        if submit.count() > 0:
-            submit.first.click()
+        # Same order as the pre-4.3 code first (a real submit button, whatever
+        # its label), so 3.x / GPU-PaaS pages behave exactly as before; then
+        # the 4.3 link-styled "Sign In"; then Enter.
+        typed_submit = page.locator("button[type='submit']:visible")
+        submit = typed_submit.first if typed_submit.count() > 0 else self._find_action(page, self._SIGNIN_NAME)
+        if submit is not None:
+            submit.click()
         else:
             print("[console_login] No Sign In button matched — submitting with Enter")
             pwd_input.press("Enter")
@@ -312,10 +349,34 @@ class ConsoleLogin:
                 raise RuntimeError(f"Controller rejected the login: {msg}")
             time.sleep(0.5)
 
+    def _enrollment_secret(self, page) -> str:
+        """
+        TOTP secret for enrollment. The controller returns it directly in the
+        first POST /auth/v1/login/ response (account.totp_url ->
+        otpauth://...?secret=...), so that is the source of truth. The QR is
+        still decoded -- for the report attachment and as a fallback -- and a
+        mismatch is logged.
+        """
+        api = getattr(self, "_api_totp_secret", "")
+        qr = ""
+        try:
+            qr = self._scan_qr(page)
+        except Exception as e:
+            print(f"[console_login] QR decode failed ({e})")
+        if api:
+            print(f"[console_login] TOTP secret from login response (totp_url): {api}")
+            if qr and qr != api:
+                print(f"[console_login] ⚠ QR secret {qr} differs from totp_url — using totp_url")
+            return api
+        if qr:
+            print(f"[console_login] TOTP secret extracted from QR: {qr}")
+            return qr
+        raise RuntimeError("No TOTP secret: login response had no totp_url and QR decode failed")
+
     def _detect_mfa_page(self, page) -> str:
         has_canvas   = page.locator("canvas").count() > 0
         has_img_qr   = page.locator("img[src*='qr'], img[alt*='QR' i]").count() > 0
-        has_verify   = page.locator("input[name='verify_token']").count() > 0
+        has_verify   = page.locator(self._MFA_SELECTOR).count() > 0
         has_sixdigit = page.locator("input[placeholder='Enter 6-digit code']").count() > 0
 
         if (has_canvas or has_img_qr) and has_verify:
@@ -368,6 +429,92 @@ class ConsoleLogin:
             raise ValueError(f"No secret found in OTP URI: {uri}")
         return secret
 
+    _MFA_SUBMIT_TEXT = re.compile(
+        r"^\s*(verify( token| code)?|submit|confirm|continue|enable( mfa)?|activate)\s*$", re.I)
+
+    def _attach_auth_logger(self, page):
+        """
+        Record every /auth/ response (method, status, URL, short body), and
+        the controller-vs-runner clock skew from the first response's Date
+        header. TOTP codes are time-based: a skew of more than ~30s makes
+        every code wrong even with the correct secret.
+        """
+        self._auth_log = []
+        self._skew_reported = False
+        self._api_totp_secret = ""
+
+        def on_response(r):
+            try:
+                if not self._skew_reported:
+                    date_hdr = r.headers.get("date")
+                    if date_hdr:
+                        from email.utils import parsedate_to_datetime
+                        skew = time.time() - parsedate_to_datetime(date_hdr).timestamp()
+                        self._skew_reported = True
+                        print(f"[console_login] Clock skew runner - controller: {skew:+.1f}s"
+                              + ("  ⚠ large enough to break TOTP" if abs(skew) > 25 else ""))
+                if "/auth/" not in r.url:
+                    return
+                if "/auth/v1/login" in r.url:
+                    try:
+                        totp_url = (r.json().get("account") or {}).get("totp_url") or ""
+                        if "secret=" in totp_url:
+                            q = urllib.parse.parse_qs(urllib.parse.urlparse(totp_url).query)
+                            self._api_totp_secret = q.get("secret", [""])[0]
+                    except Exception:
+                        pass
+                body = ""
+                try:
+                    body = r.text()[:200]
+                except Exception:
+                    pass
+                sent = ""
+                if "/auth/v1/login" in r.url and r.request.method == "POST":
+                    try:
+                        import json as _json
+                        pd = _json.loads(r.request.post_data or "{}")
+                        sent = " | sent: " + ", ".join(
+                            f"{k}={'***' if 'password' in k and v else v!r}"
+                            for k, v in pd.items() if k in ("username", "password", "totp"))
+                    except Exception:
+                        pass
+                self._auth_log.append(f"{r.request.method} {r.status} {r.url.split('?')[0]} {body}{sent}")
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
+    def _print_auth_log_since(self, start: int, attempt: int):
+        new = self._auth_log[start:]
+        if not new:
+            print(f"[console_login]   attempt {attempt}: NO /auth/ request was sent after "
+                  f"submitting — the OTP form was not submitted")
+        for line in new:
+            print(f"[console_login]   attempt {attempt}: {line}")
+
+    def _dump_mfa_controls(self, page):
+        """Print the MFA page's candidate submit controls so the next fix
+        can target the real element instead of guessing."""
+        try:
+            info = page.evaluate("""() => {
+                const out = [];
+                const inp = document.querySelector("input[name='verify_token'], input[placeholder='Enter 6-digit code'], input[name='totp'], input[name*='otp' i]");
+                out.push('otp input inside <form>: ' + !!(inp && inp.closest('form')));
+                const cands = document.querySelectorAll("button, [role=button], input[type=submit], a, div, span");
+                for (const el of cands) {
+                    const t = (el.innerText || el.value || '').trim();
+                    if (t && t.length < 40 && /verify|submit|confirm|continue|enable|activate/i.test(t)
+                        && el.children.length < 3) {
+                        out.push(el.outerHTML.slice(0, 250));
+                    }
+                    if (out.length > 12) break;
+                }
+                return out.join('\\n');
+            }""")
+            print(f"[console_login] MFA page controls:\n{info}")
+        except Exception as e:
+            print(f"[console_login] Could not inspect MFA page controls: {e}")
+
     def _click_submit(self, page, fallback_input=None):
         """
         Submit the MFA form. Tries a button by accessible name first; if the
@@ -379,11 +526,36 @@ class ConsoleLogin:
         worked) and the MFA page failed with "Could not find submit button".
         Enter submits the form the same way a click would.
         """
+        action = self._find_action(page, self._MFA_SUBMIT_TEXT)
+        if action is not None:
+            print(f"[console_login] Clicking MFA submit ({action.inner_text().strip()!r})")
+            action.click()
+            return
+        # Pre-4.3 behaviour, unchanged: button whose label CONTAINS one of these
+        # (e.g. "Verify & Continue"), as the original code matched.
         for label in ["Verify Token", "Verify", "Submit", "Confirm", "Continue", "Sign in"]:
             btn = page.get_by_role("button", name=label, exact=False)
             if btn.count() > 0:
                 btn.first.click()
                 return
+        # Clickable element with a submit label that has no button role
+        # (div/span/a styled as a button).
+        by_text = page.get_by_text(self._MFA_SUBMIT_TEXT)
+        if by_text.count() > 0:
+            print("[console_login] Clicking MFA submit control by its text "
+                  f"({by_text.first.inner_text().strip()!r})")
+            before = len(getattr(self, "_auth_log", []))
+            by_text.first.click()
+            # If that text was only a label (nothing got sent), fall back to Enter.
+            time.sleep(1.5)
+            if fallback_input is not None and len(getattr(self, "_auth_log", [])) == before:
+                try:
+                    if fallback_input.is_visible():
+                        print("[console_login] Text click sent no request — submitting with Enter")
+                        fallback_input.press("Enter")
+                except Exception:
+                    pass
+            return
         if fallback_input is not None:
             print("[console_login] No MFA submit button matched — submitting with Enter")
             fallback_input.press("Enter")

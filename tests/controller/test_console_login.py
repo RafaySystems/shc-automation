@@ -161,6 +161,31 @@ def _save_secret_to_config(env: str, secret: str):
         print(f"[console_login] Could not save secret: {e}")
 
 
+def _resolve_mfa_secret(request, console_cfg) -> str:
+    """
+    Pick the admin TOTP secret to use, in priority order:
+      1. --mfa-secret CLI flag
+      2. a secret captured earlier in THIS session (fresh QR scan)
+      3. dev.yaml console.mfa_secret -- ONLY when testing an existing
+         controller. With --provision the controller is brand new, so any
+         secret in dev.yaml belongs to an older controller (build #164 ran
+         with a stale committed '75WHX...' value) and must be ignored, so
+         the first login goes through QR enrollment instead.
+    """
+    cli = request.config.getoption("--mfa-secret", default=None)
+    if cli:
+        return cli
+    fresh = getattr(request.session, "_fresh_mfa_secret", None)
+    if fresh:
+        return fresh
+    if request.config.getoption("--provision", default=False):
+        if console_cfg.get("mfa_secret"):
+            print("[console_login] --provision: ignoring dev.yaml mfa_secret "
+                  "(belongs to a previous controller) — expecting QR enrollment")
+        return ""
+    return console_cfg.get("mfa_secret") or ""
+
+
 def _get_star_domain(request, controller_fqdn, raw_config) -> str:
     """Resolve star_domain from controller_fqdn or --build-no + base_domain."""
     if controller_fqdn:
@@ -361,17 +386,13 @@ class TestConsoleLogin:
         console_cfg = raw_config.get("console", {})
         email       = console_cfg.get("email",    "admin@rafay.co")
         password    = console_cfg.get("password", "change123")
-        mfa_secret  = (
-            request.config.getoption("--mfa-secret", default=None)
-            or console_cfg.get("mfa_secret")
-            or None
-        )
+        mfa_secret  = _resolve_mfa_secret(request, console_cfg) or None
 
         attach_output(extras, "Console URL", console_url)
         attach_output(extras, "Email", email)
         attach_output(extras, "MFA secret source",
                       "CLI" if request.config.getoption("--mfa-secret", default=None)
-                      else "dev.yaml" if console_cfg.get("mfa_secret")
+                      else "dev.yaml" if mfa_secret
                       else "QR scan")
 
         print(f"\n[console_login] Logging in to {console_url} ...")
@@ -472,8 +493,7 @@ class TestOrgAndUser:
         # controller-re-provisioned / fresh-QR-scan case) over the
         # session-cached raw_config value, which may now be stale even
         # though dev.yaml on disk was updated.
-        admin_secret   = getattr(request.session, "_fresh_mfa_secret", None) \
-                          or console_cfg.get("mfa_secret") or ""
+        admin_secret   = _resolve_mfa_secret(request, console_cfg)
 
         csrftoken, session = _get_authenticated_session(
             ops_url, admin_email, admin_password, admin_secret, extras=extras, request=request
@@ -515,6 +535,7 @@ class TestOrgAndUser:
             )
             print(f"[org_user] ✓ Org + user created")
 
+        request.session._org_user_created = True
         request.session._test_username = username
         request.session._test_password = password
         request.session._star_domain   = star_domain
@@ -533,9 +554,17 @@ class TestOrgAndUser:
                 "No private key can be generated for user custom public key"
             )
 
+    def _require_org_user(self, request):
+        """Skip when test_create_org_and_user didn't create the user this run --
+        otherwise these tests fail with a misleading AUTH002 for a user that
+        simply doesn't exist (build #164), masking the real admin-login failure."""
+        if not getattr(request.session, "_org_user_created", False):
+            pytest.skip("Org user was not created this run (see test_create_org_and_user)")
+
     def test_prelogin_check(self, request, controller_fqdn,
                              raw_config, extras):
         """POST /auth/v1/prelogin/ — verify user exists in system."""
+        self._require_org_user(request)
         _, _, console_url, _, org_cfg, _ = \
             self._resolve(request, controller_fqdn, raw_config)
 
@@ -564,6 +593,7 @@ class TestOrgAndUser:
         Login as org user via POST /auth/v1/login/.
         Verifies session cookie returned, then captures browser screenshot.
         """
+        self._require_org_user(request)
         _, _, console_url, _, org_cfg, _ = \
             self._resolve(request, controller_fqdn, raw_config)
 
@@ -650,8 +680,7 @@ class TestOrgAndUser:
 
         admin_email    = console_cfg.get("email",    "admin@rafay.co")
         admin_password = console_cfg.get("password", "change123")
-        admin_secret   = getattr(request.session, "_fresh_mfa_secret", None) \
-                          or console_cfg.get("mfa_secret") or ""
+        admin_secret   = _resolve_mfa_secret(request, console_cfg)
 
         csrftoken, session = _get_authenticated_session(
             ops_url, admin_email, admin_password, admin_secret, extras=extras, request=request
