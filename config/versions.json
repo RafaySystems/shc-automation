@@ -16,7 +16,7 @@
           "rauto_branch": "v3.5.x"
         },
         "3.7": {
-          "package_url": "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/3.7/rafay-airgapped-controller-3.7-11.tar.gz",
+          "package_url": "https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/3.7/rafay-airgapped-controller-3.7-13.tar.gz",
           "notes": "",
           "can_upgrade_to": ["4.0","4.3"],
           "rctl_build": "v3.7.x-9",
