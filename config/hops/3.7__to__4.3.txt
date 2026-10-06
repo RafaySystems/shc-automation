@@ -1,0 +1,70 @@
+[pre_commands]
+
+# Cleanup tmp
+sudo rm -rf /tmp/radm.log /tmp/rafay-dep* /tmp/rafay-cluster* /tmp/rafay-core* /tmp/istio-* 2>/dev/null || true
+
+# Install pigz for faster extraction
+sudo apt-get -o Acquire::ForceIPv4=true install -y pigz 2>&1 || true
+
+# Backup old config
+mkdir -p /home/controller/backup && cp /opt/rafay/rafay-airgapped-controller-3.7-11/config.yaml /home/controller/backup/config.yaml-3.7
+
+# Copy new radm and extract binaries
+sudo cp /opt/rafay/rafay-airgapped-controller-4.3-4/radm /usr/bin/ && sudo radm extract-binaries
+
+#Patch the clickhouse
+kubectl -n rafay-core get sts clickhouse clickhouse-keeper -o custom-columns='NAME:.metadata.name,VCT:.spec.volumeClaimTemplates[*].metadata.name,SIZE:.spec.volumeClaimTemplates[*].spec.resources.requests.storage,PVCPOLICY:.spec.persistentVolumeClaimRetentionPolicy,SC:.spec.volumeClaimTemplates[*].spec.storageClassName'
+kubectl -n rafay-core get pvc | grep -E 'clickhouse|keeper'
+kubectl get pvc -n rafay-core clickhouse-storage-clickhouse-0 -o jsonpath='{.spec.storageClassName}{"\n"}'
+kubectl patch storageclass openebs-hostpath -p '{"allowVolumeExpansion":true}'
+for pvc in clickhouse-storage-clickhouse-0 clickhouse-storage-clickhouse-1; do pv=$(kubectl -n rafay-core get pvc "$pvc" -o jsonpath='{.spec.volumeName}'); echo "Patching $pvc -> $pv to 200Gi"; kubectl patch pv "$pv" --type merge -p '{"spec":{"capacity":{"storage":"200Gi"}}}'; kubectl patch pvc "$pvc" -n rafay-core --type merge -p '{"spec":{"resources":{"requests":{"storage":"200Gi"}}}}'; done
+kubectl -n rafay-core delete sts clickhouse --cascade=orphan
+
+#Patch the istio CRDs and nexus
+for crd in $(kubectl get crd -o name | grep -E '\.istio\.io$'); do echo "Patching $crd"; kubectl annotate "$crd" meta.helm.sh/release-name=istio-base meta.helm.sh/release-namespace=istio-system --overwrite; kubectl label "$crd" app.kubernetes.io/managed-by=Helm --overwrite; done
+kubectl annotate crd istiooperators.install.istio.io meta.helm.sh/release-name=istio-base meta.helm.sh/release-namespace=istio-system --overwrite 2>/dev/null
+kubectl label crd istiooperators.install.istio.io app.kubernetes.io/managed-by=Helm --overwrite 2>/dev/null
+kubectl get cm,sts,svc,destinationrule -n rafay-core -o json | jq -r '.items[] | select(.metadata.annotations["meta.helm.sh/release-name"]=="rafay-core") | select(.metadata.name|test("nexus")) | "\(.kind)/\(.metadata.name)"' | while read -r r; do kubectl annotate -n rafay-core "$r" meta.helm.sh/release-name=rafay-repo meta.helm.sh/release-namespace=rafay-core --overwrite; kubectl label -n rafay-core "$r" app.kubernetes.io/managed-by=Helm --overwrite; done
+
+#Delete nexus sts, upload-agent job and eaas-api
+kubectl delete sts -n rafay-core nexus
+kubectl delete job -n rafay-core rafay-core-upload-agent-config-file
+kubectl delete deploy -n rafay-core eaas-api
+
+#Clean up old prometheus setup
+kubectl delete all -l app.kubernetes.io/part-of=kube-prometheus-stack -n rafay-core
+kubectl delete all -l app.kubernetes.io/part-of=prometheus-adapter -n rafay-core
+kubectl delete all -l app=prometheus-node-exporter -n rafay-core
+kubectl delete all -l app.kubernetes.io/name=kube-state-metrics -n rafay-core
+kubectl delete $(kubectl api-resources --verbs=list --namespaced -o name | tr '\n' ',' | sed 's/,$//') -l app.kubernetes.io/part-of=kube-prometheus-stack -n rafay-core
+kubectl delete all -l app.kubernetes.io/part-of=kube-prometheus-stack -n kube-system
+kubectl delete svc -n kube-system rafay-core-kube-prometheus-kubelet
+kubectl delete cm -n rafay-core rafay-core-alertmanager rafay-core-prometheus-adapter
+kubectl delete svc -n rafay-core rafay-core-alertmanager rafay-core-alertmanager-headless
+kubectl delete sts -n rafay-core rafay-core-alertmanager
+kubectl delete secret -n rafay-core kube-prometheus-stack-grafana
+
+[after_radm_dependency]
+#Scale down and up the clickhouse pods
+kubectl -n rafay-core scale sts clickhouse --replicas=0 && kubectl -n rafay-core wait --for=delete pod -l app=clickhouse --timeout=5m && kubectl -n rafay-core scale sts clickhouse --replicas=2
+
+#Patch the frontend logo
+kubectl -n rafay-core annotate configmap frontend-logo meta.helm.sh/release-name=rafay-core meta.helm.sh/release-namespace=rafay-core --overwrite
+kubectl -n rafay-core label configmap frontend-logo app.kubernetes.io/managed-by=Helm --overwrite
+
+[expected_es_version]
+9.4.4
+
+[expected_postgresql_status]
+Running
+
+[after_radm_application]
+#minio -> seaweedfs migration
+wget -O /tmp/minio-seaweedfs-migration.yaml https://rafay-airgap-controller.s3.us-west-2.amazonaws.com/4.0/minio-seaweedfs-migration.yaml
+kubectl apply -f /tmp/minio-seaweedfs-migration.yaml
+
+#Verify MKS entries in salt
+kubectl exec -n rafay-core infra-salt-orchestrator-0 -- salt '*' test.ping
+
+[after_radm_cluster]
+cd /opt/rafay/rafay-airgapped-controller-3.7-11/ && sudo radm cluster --config config.yaml

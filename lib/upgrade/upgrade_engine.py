@@ -54,6 +54,12 @@ PHASE_WAIT = {
     "postgresql":       {"interval": 20, "max_wait": 600},
 }
 
+# A hop command that STARTS with one of these (optionally after `sudo`)
+# needs internet: the engine attaches the NSG before it and detaches right
+# after it, so hop files only ever contain the plain patch commands.
+INTERNET_CMD_RE = re.compile(r"^\s*(?:sudo\s+)?(?:wget|curl|aria2c|apt-get|apt)\b")
+INTERNET_CMD_TIMEOUT = 1800
+
 
 class UpgradeEngine:
 
@@ -189,12 +195,33 @@ class UpgradeEngine:
         for i, cmd in enumerate(commands, 1):
             label = cmd.strip()[:60] + ("..." if len(cmd.strip()) > 60 else "")
             print(f"[upgrade] [{i}/{len(commands)}] {label}")
+            needs_net = bool(INTERNET_CMD_RE.match(cmd))
             run_cmd = f"cd {cwd} && {cmd}" if cwd else cmd
             try:
-                out, rc = self.ssh.run(run_cmd, timeout=120)
+                if needs_net:
+                    self._set_internet(True)
+                out, rc = self.ssh.run(run_cmd, timeout=INTERNET_CMD_TIMEOUT if needs_net else 120)
                 print(f"[upgrade] ✓" if rc == 0 else f"[upgrade] ⚠ WARNING (exit {rc}): {out[-150:]} — continuing")
             except Exception as e:
                 print(f"[upgrade] ⚠ WARNING: {e} — continuing")
+            finally:
+                if needs_net:
+                    self._set_internet(False)
+
+    def _set_internet(self, on: bool):
+        """Attach (on=True) or detach (on=False) the NSG around one internet command."""
+        if not self.nsg:
+            return
+        try:
+            if on:
+                self.nsg.attach()
+                print("[upgrade] NSG attached for internet command — waiting 30s ...")
+                time.sleep(30)
+            else:
+                self.nsg.detach()
+                print("[upgrade] NSG detached ✓")
+        except Exception as e:
+            print(f"[upgrade] ⚠ NSG {'attach' if on else 'detach'} warning: {e}")
 
     # ── Phase implementations ─────────────────────────────────────────────────
 
@@ -214,14 +241,16 @@ class UpgradeEngine:
         aria2c_bin = aria2c_out.strip() or "/usr/bin/aria2c"
 
         print(f"[download_new_package] Downloading: {self.dst_package_url}")
-        out, rc = self.ssh.run(
-            f"sudo {aria2c_bin} -x 16 -s 16 --max-tries=3 --retry-wait=10 "
-            f"--connect-timeout=30 -d {self.install_dir} {self.dst_package_url} 2>&1",
-            timeout=1800
-        )
-        if self.nsg:
-            self.nsg.detach()
-            print("[download_new_package] NSG detached ✓")
+        try:
+            out, rc = self.ssh.run(
+                f"sudo {aria2c_bin} -x 16 -s 16 --max-tries=3 --retry-wait=10 "
+                f"--connect-timeout=30 -d {self.install_dir} {self.dst_package_url} 2>&1",
+                timeout=1800
+            )
+        finally:
+            if self.nsg:
+                self.nsg.detach()
+                print("[download_new_package] NSG detached ✓")
 
         assert rc == 0, f"aria2c download failed (exit {rc}): {out[-300:]}"
         print(f"[download_new_package] Downloaded ✓")
