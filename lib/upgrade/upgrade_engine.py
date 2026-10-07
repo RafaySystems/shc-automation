@@ -26,9 +26,11 @@ Phases, in the order they run:
   1.  pre_commands             — from conftest.py (canned + Jenkins)
   2.  download                 — new package via aria2c
   3.  extract                  — new package via pigz/tar
-  4.  create_config            — copy template, patch archive-directory,
+  4.  create_config            — copy old config.yaml (src bundle dir, or
+                                  /home/controller/backup if a pre_command
+                                  moved it), patch archive-directory,
                                   then apply config_patches
-  5.  copy_radm                — new radm → /usr/bin/
+  5.  copy_radm                — new radm → /usr/bin/, then radm extract-binaries
   6.  radm dependency          — always same, NEW package only
       after_radm_dependency_commands — from conftest.py (canned + Jenkins)
   7.  wait elasticsearch       — wait for green
@@ -271,10 +273,24 @@ class UpgradeEngine:
         print(f"[extract_new_package] Extracted to {self.dst_extract_dir} ✓")
 
     def _create_upgrade_config(self):
-        old_config = f"{self.src_extract_dir}/config.yaml"
         new_config = f"{self.dst_extract_dir}/config.yaml"
 
-        self.ssh.run(f"sudo cp {old_config} {new_config}")
+        # The old config.yaml normally sits in the src bundle dir, but a
+        # pre_command may already have moved it to /home/controller/backup
+        # (the 3.7 -> 4.3 doc does `mv config.yaml .../config.yaml-3.7`).
+        # Use whichever exists, and FAIL if neither does -- silently
+        # continuing would run every radm command against the new bundle's
+        # default config.yaml instead of this controller's real one.
+        out, rc = self.ssh.run(
+            f"src={self.src_extract_dir}/config.yaml; "
+            f"sudo test -f \"$src\" || src=$(sudo ls -t /home/controller/backup/config.yaml-* 2>/dev/null | head -1); "
+            f"[ -n \"$src\" ] && sudo test -f \"$src\" && sudo cp \"$src\" {new_config} && echo \"COPIED $src\""
+        )
+        assert rc == 0 and "COPIED" in out, (
+            f"old config.yaml not found in {self.src_extract_dir} or /home/controller/backup: {out[-300:]}"
+        )
+        print(f"[create_upgrade_config] {out.strip().splitlines()[-1]} → {new_config}")
+
         self.ssh.run(f"sudo sed -i 's|archive-directory:.*|archive-directory: RAFAY_PH|' {new_config}")
         self.ssh.run(f"sudo sed -i 's|archive-directory: RAFAY_PH|archive-directory: {self.dst_extract_dir}|' {new_config}")
         print(f"[create_upgrade_config] ✓ archive-directory: {self.dst_extract_dir}")
@@ -293,6 +309,10 @@ class UpgradeEngine:
         )
         assert rc == 0 and "OK" in out, f"radm copy failed: {out}"
         print("[copy_new_radm] new radm → /usr/bin/radm ✓")
+
+        out, rc = self.ssh.run("sudo radm extract-binaries 2>&1", timeout=600)
+        assert rc == 0, f"radm extract-binaries failed (exit {rc}): {out[-300:]}"
+        print("[copy_new_radm] radm extract-binaries ✓ (kubeadm, helm → /usr/bin)")
 
     def _radm_dependency(self):
         print("[radm_dependency] Running ...")
