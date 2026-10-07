@@ -39,6 +39,11 @@ kubectl delete cm -n rafay-core rafay-core-alertmanager rafay-core-prometheus-ad
 kubectl delete svc -n rafay-core rafay-core-alertmanager rafay-core-alertmanager-headless --ignore-not-found
 kubectl delete sts -n rafay-core rafay-core-alertmanager --ignore-not-found
 kubectl delete secret -n rafay-core kube-prometheus-stack-grafana --ignore-not-found
+
+[config_patches]
+# Runs from the new 4.3-4 dir, right after extraction and before radm dependency
+sudo cp radm /usr/bin/
+sudo radm extract-binaries
  
 [after_radm_dependency]
 #Scale down and up the clickhouse pods

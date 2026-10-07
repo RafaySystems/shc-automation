@@ -30,7 +30,7 @@ Phases, in the order they run:
                                   /home/controller/backup if a pre_command
                                   moved it), patch archive-directory,
                                   then apply config_patches
-  5.  copy_radm                — new radm → /usr/bin/, then radm extract-binaries
+  5.  copy_radm                — new radm → /usr/bin/
   6.  radm dependency          — always same, NEW package only
       after_radm_dependency_commands — from conftest.py (canned + Jenkins)
   7.  wait elasticsearch       — wait for green
@@ -309,10 +309,6 @@ class UpgradeEngine:
         )
         assert rc == 0 and "OK" in out, f"radm copy failed: {out}"
         print("[copy_new_radm] new radm → /usr/bin/radm ✓")
-
-        out, rc = self.ssh.run("sudo radm extract-binaries 2>&1", timeout=600)
-        assert rc == 0, f"radm extract-binaries failed (exit {rc}): {out[-300:]}"
-        print("[copy_new_radm] radm extract-binaries ✓ (kubeadm, helm → /usr/bin)")
 
     def _radm_dependency(self):
         print("[radm_dependency] Running ...")
