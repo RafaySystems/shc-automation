@@ -19,6 +19,7 @@ Flow:
                                  IN PARALLEL (ThreadPoolExecutor, one worker
                                  per secondary node)
     11. radm_init()            — radm init + kubeconfig + HA join
+                                 (+ kubeconfig on each joined secondary node)
                                  → polls node Ready every 30s for 5 min
     12. radm_dependency()      — radm dependency
                                  → command timeout 1800s (30 min)
@@ -59,6 +60,14 @@ PHASE_WAIT = {
     "radm_application": {"interval": 20, "max_wait": 1200,  "label": "pods Running"},
     "radm_cluster":     {"interval": 20, "max_wait": 800,  "label": "pods Running"},
 }
+
+# Kubeconfig setup from the manual bringup docs -- run on node1 after
+# radm init, and on each secondary node after radm join.
+KUBECONFIG_SETUP_CMD = (
+    "mkdir -p $HOME/.kube && "
+    "sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config && "
+    "sudo chown $(id -u):$(id -g) -R $HOME/.kube"
+)
 
 
 class BringupError(Exception):
@@ -745,7 +754,8 @@ class ControllerBringup:
         return cache[subcommand]
 
     def _radm_init(self):
-        """radm init on node1, kubeconfig setup, HA join on node2+3."""
+        """radm init on node1, kubeconfig setup, HA join on node2+3
+        (each joined secondary node also gets kubeconfig setup)."""
         self.ssh.run("sudo systemctl stop consul kubelet 2>/dev/null || true && sleep 2", timeout=15)
         self.ssh.run("sudo kubeadm reset -f 2>/dev/null || true", timeout=30)
         self.ssh.run(
@@ -767,10 +777,7 @@ class ControllerBringup:
         assert rc == 0, f"radm init failed (exit {rc}): {out[-500:]}"
         print("[radm_init] radm init complete ✓")
 
-        _, krc = self.ssh.run(
-            "mkdir -p $HOME/.kube && sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config && "
-            "sudo chown $(id -u):$(id -g) -R $HOME/.kube && echo OK"
-        )
+        _, krc = self.ssh.run(f"{KUBECONFIG_SETUP_CMD} && echo OK")
         assert krc == 0, "kubeconfig setup failed"
 
         if self.profile.ha and self.secondary_ips:
@@ -854,6 +861,11 @@ class ControllerBringup:
         collected and raised together at the end so every node is always
         attempted, matching the pattern already used in
         _setup_secondary_nodes.
+
+        After a node joins successfully, kubeconfig is set up on it via
+        _setup_kubeconfig_on_secondary(). Skipped for a node whose join
+        failed, so a join failure isn't followed by a misleading second
+        kubeconfig error.
         """
         pri_ip, token, ca_hash, cert_key = self._parse_ha_join_from_output(radm_init_output)
 
@@ -919,11 +931,41 @@ class ControllerBringup:
                     f"see full output printed above"
                 )
                 print(f"[ha_join] node{i} ({sec_ip}) joined ✓")
+                self._setup_kubeconfig_on_secondary(i, sec_ip)
             except Exception as e:
                 errors.append(f"node{i} ({sec_ip}): {e}")
 
         if errors:
             raise AssertionError("HA join failed:\n" + "\n".join(errors))
+
+    def _setup_kubeconfig_on_secondary(self, i: int, sec_ip: str):
+        """
+        Same kubeconfig step node1 gets in _radm_init, run on a joined
+        secondary node. This is part of the documented manual HA bringup,
+        so it doesn't violate the no-undocumented-steps rule in _ha_join.
+
+        Uses subprocess + system ssh (same as the join) rather than
+        paramiko. Retries because the node's own apiserver can take a few
+        seconds to settle right after join, so the kubectl check may fail
+        on the first try even though the copy succeeded.
+        """
+        ssh_cmd = [
+            "ssh", "-i", self.profile.ssh_key,
+            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=30", f"{self.profile.user}@{sec_ip}",
+            f"{KUBECONFIG_SETUP_CMD} && kubectl get nodes --no-headers >/dev/null && echo KUBECTL_OK",
+        ]
+        out = ""
+        for attempt in range(1, 4):
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=120)
+            out = (result.stdout + result.stderr).strip()
+            if result.returncode == 0 and "KUBECTL_OK" in out:
+                print(f"[ha_join] node{i} ({sec_ip}) kubeconfig configured, kubectl works ✓")
+                return
+            print(f"[ha_join] node{i} kubeconfig attempt {attempt}/3 failed:\n{out}")
+            if attempt < 3:
+                time.sleep(15)
+        raise AssertionError(f"kubeconfig setup failed on node{i} ({sec_ip}): {out[-300:]}")
 
     def _radm_dependency(self):
         """
