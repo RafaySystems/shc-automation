@@ -31,6 +31,30 @@ _ALL_SECTIONS = _PATCH_SECTIONS + _SCALAR_SECTIONS
 _SECTION_RE = re.compile(r"^\[([a-z_]+)\]\s*$")
 
 
+def resolve_owner_email(default: str = "") -> tuple:
+    """Email for the `owner` tag of OCI VMs this framework launches.
+
+    Returns (email, source). First match wins:
+      1. TRIGGERED_BY_EMAIL     -- set by Rauto.jenkinsfile to the user who triggered the build
+      2. BUILD_USER_EMAIL       -- Jenkins "build user vars" plugin, if present
+      3. git config user.email  -- local runs: whoever is running the tests
+      4. `default`              -- e.g. the owner tag in dev.yaml (last resort)
+    """
+    import subprocess
+    for var in ("TRIGGERED_BY_EMAIL", "BUILD_USER_EMAIL"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value, var
+    try:
+        value = subprocess.run(["git", "config", "user.email"], capture_output=True,
+                               text=True, timeout=5).stdout.strip()
+        if value:
+            return value, "git config user.email"
+    except Exception:  # noqa: BLE001 -- git missing / not a repo: fall through
+        pass
+    return default, "dev.yaml owner tag"
+
+
 def normalize_version(version: str) -> str:
     """
     Normalizes a version string to the dash-separated form used in hop

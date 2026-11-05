@@ -174,12 +174,14 @@ class TerraformManager:
 
         tags = dict(p.tags or {})
 
-        # owner tag: prefer the Jenkins-captured triggering user (set by
-        # Rauto.jenkinsfile as TRIGGERED_BY_EMAIL); fall back to whatever
-        # literal value dev.yaml has, for local/non-Jenkins runs.
-        triggered_by_email = os.environ.get("TRIGGERED_BY_EMAIL")
-        if triggered_by_email:
-            tags["owner"] = triggered_by_email
+        # owner tag: the user who triggered the Jenkins build (TRIGGERED_BY_EMAIL,
+        # set by Rauto.jenkinsfile), else BUILD_USER_EMAIL, else the local git
+        # user, else dev.yaml's value -- see utils.helpers.resolve_owner_email.
+        from utils.helpers import resolve_owner_email
+        owner, owner_source = resolve_owner_email(tags.get("owner", ""))
+        if owner:
+            tags["owner"] = owner
+        print(f"[owner] VM owner tag = {owner or '(none)'} (from {owner_source})")
 
         def _hcl_escape(value: str) -> str:
             return str(value).replace("\\", "\\\\").replace('"', '\\"')
