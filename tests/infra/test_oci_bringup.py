@@ -62,9 +62,18 @@ class TestOCIProvisioning:
         if oci_instance["id"] is None:
             pytest.skip("SKIP_OCI_CREATE=1 — skipping tag check")
 
-        expected_tags = oci_instance["profile"].tags
+        expected_tags = dict(oci_instance["profile"].tags or {})
         if not expected_tags:
             pytest.skip("No custom tags configured in dev.yaml — skipping")
+
+        # `owner` is not taken verbatim from dev.yaml: tf_manager._write_tfvars
+        # overrides it with the triggering user's email (TRIGGERED_BY_EMAIL,
+        # etc.). Expect the same resolved value here, otherwise every Jenkins
+        # run started by a user fails with "expected 'shc-automation@rafay.co'".
+        from utils.helpers import resolve_owner_email
+        owner, _ = resolve_owner_email(expected_tags.get("owner", ""))
+        if owner:
+            expected_tags["owner"] = owner
 
         resp = oci_vm_manager.compute_client.get_instance(oci_instance["id"])
         actual_tags = resp.data.freeform_tags or {}
