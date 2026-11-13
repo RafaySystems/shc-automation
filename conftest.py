@@ -46,13 +46,37 @@ def decode_commands(b64_str: str) -> list:
 CONTROLLER_SUMMARY = {}
 
 
+def _add_ssh_key_info(config):
+    """
+    Build the SSH key entries here rather than in a test, so a failed
+    login/MFA test can't hide them. Uses only values known at startup.
+    setdefault() keeps anything a test already set.
+    """
+    if config.getoption("--extra-ssh-public-key-b64"):
+        CONTROLLER_SUMMARY.setdefault(
+            "Custom SSH Key",
+            "No private key can be generated for user custom public key",
+        )
+        return
+
+    build_url = os.environ.get("BUILD_URL", "")
+    if build_url:
+        CONTROLLER_SUMMARY.setdefault(
+            "SSH Key Download", f"{build_url.rstrip('/')}/artifact/keys/oci.key"
+        )
+    else:
+        local_key = os.environ.get("RAUTO_OCI_SSH_KEY") or config.getoption("--ssh-key")
+        if local_key:
+            CONTROLLER_SUMMARY.setdefault("SSH Key (local)", local_key)
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    _add_ssh_key_info(config)
     if not CONTROLLER_SUMMARY:
         return
     terminalreporter.write_sep("=", "Controller Info")
     for key, value in CONTROLLER_SUMMARY.items():
         terminalreporter.write_line(f"{key:20s}: {value}")
-
 
 def pytest_addoption(parser):
     parser.addoption("--env",             default="dev",  help="Config env: dev | staging")
@@ -151,6 +175,17 @@ def pytest_addoption(parser):
                      help="Full URL to the version-specific ncp-templates tarball. "
                           "Only read when --load-skus is also set.")
 
+    # ── Controller regression (node lifecycle) -- same on/off-switch pattern
+    # as --run-backup-restore / --load-skus: tests in
+    # tests/regression/test_controller_regression.py are marked
+    # @pytest.mark.controller_regression and skipped unless this is set.
+    parser.addoption("--run-controller-regression", action="store_true", default=False,
+                     help="Also run the controller node-lifecycle regression (marked controller_regression)")
+    parser.addoption("--regression-health-interval", type=int, default=30,
+                     help="Seconds between node health samples in the controller regression")
+    parser.addoption("--regression-health-samples", type=int, default=10,
+                     help="Number of node health samples in the controller regression")
+
 
 def pytest_collection_modifyitems(config, items):
     """
@@ -183,6 +218,13 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if "sku_load" in item.keywords:
                 item.add_marker(skip_sku)
+
+    # Controller regression -- third independent block, same pattern.
+    if not config.getoption("--run-controller-regression"):
+        skip_cr = pytest.mark.skip(reason="need --run-controller-regression to run controller regression")
+        for item in items:
+            if "controller_regression" in item.keywords:
+                item.add_marker(skip_cr)
 
 
 @pytest.fixture(scope="session", autouse=True)

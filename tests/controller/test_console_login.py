@@ -379,7 +379,7 @@ class TestOrgAndUser:
         )
 
     def test_create_org_and_user(self, request, controller_fqdn,
-                                  raw_config, extras, oci_profile_fixture):
+                                  raw_config, extras):
         """Create org + admin user via POST /auth/v1/signup/organization/"""
         star_domain, ops_url, console_url, console_cfg, org_cfg, partner_id = \
             self._resolve(request, controller_fqdn, raw_config)
@@ -458,14 +458,6 @@ class TestOrgAndUser:
         CONTROLLER_SUMMARY["Password"]              = password
         CONTROLLER_SUMMARY["Super Admin Username"]  = admin_email
         CONTROLLER_SUMMARY["Super Admin Password"]  = admin_password
-
-        if build_url := os.environ.get("BUILD_URL"):
-            CONTROLLER_SUMMARY["SSH Key Download"] = f"{build_url}artifact/keys/oci.key"
-
-        if oci_profile_fixture is not None and oci_profile_fixture.is_custom_ssh_key:
-            CONTROLLER_SUMMARY["Custom SSH Key"] = (
-                "No private key can be generated for user custom public key"
-            )
 
     def _require_org_user(self, request):
         """Skip when test_create_org_and_user didn't create the user this run --
