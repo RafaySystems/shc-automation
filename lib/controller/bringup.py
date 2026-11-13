@@ -5,7 +5,6 @@ ControllerBringup — single function to bring up a Rafay airgapped controller.
 Called as a pytest fixture before validation test classes run.
 
 Flow:
-    1.  patch_hosts()          — fix OCI self-referential IP issue
     2.  setup_install_dir()    — mkdir /opt/rafay
     3.  fix_dns()              — ensure /etc/resolv.conf is valid
     4.  disable_firewall()     — ufw + iptables flush
@@ -159,7 +158,6 @@ class ControllerBringup:
         self._phase("radm_init",            self._radm_init)
         self._phase("radm_dependency",      self._radm_dependency)
         self._phase("radm_application",     self._radm_application)
-        self._phase("patch_hosts",          self._patch_hosts)
         self._capture_containerd_config("before radm_cluster")
         self._snapshot_health("before radm_cluster")
         self._start_iostat_capture("radm_cluster")
@@ -1003,21 +1001,6 @@ class ControllerBringup:
             label="after radm application",
         )
 
-    def _patch_hosts(self):
-        """Patch /etc/hosts so star-domain resolves to 127.0.0.1."""
-        if not self.star_domain:
-            print("[patch_hosts] star_domain not set — skipping")
-            return
-        for hostname in [
-            f"ops-console.{self.star_domain}",
-            f"registry.{self.star_domain}",
-            f"*.{self.star_domain}",
-        ]:
-            self.ssh.run(
-                f"grep -q '{hostname}' /etc/hosts || "
-                f"echo '127.0.0.1 {hostname}' | sudo tee -a /etc/hosts"
-            )
-        print(f"[patch_hosts] /etc/hosts patched for {self.star_domain} ✓")
 
     def _radm_cluster(self):
         """
