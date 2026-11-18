@@ -45,7 +45,10 @@ Jenkins params:
 import time
 import subprocess
 import base64
+import shlex
 from typing import Optional, List
+
+from lib.aws.s3_presign import presign_s3_url, redact_presigned
 
 
 # ── Retry wait policies per phase ─────────────────────────────────────────────
@@ -466,18 +469,22 @@ class ControllerBringup:
         aria2c_bin_out, _ = self.ssh.run("which aria2c")
         aria2c_bin = aria2c_bin_out.strip() or "/usr/bin/aria2c"
 
+        # Signed right before the download (node has no AWS credentials).
+        # -o keeps the saved name identical to the plain URL's file name.
+        dl_url = presign_s3_url(self.pkg.url)
         print(f"[download_package] Downloading: {self.pkg.url}")
         out, rc = self.ssh.run(
             f"cd {self.pkg.install_dir} && "
             f"sudo {aria2c_bin} -x 16 -s 16 --max-tries=3 --retry-wait=10 "
-            f"--connect-timeout=30 --log-level=notice {self.pkg.url} 2>&1",
+            f"--connect-timeout=30 --log-level=notice "
+            f"-o {shlex.quote(self.pkg.name)} {shlex.quote(dl_url)} 2>&1",
             timeout=1800
         )
         if self.nsg:
             self.nsg.detach()
             print("[download_package] NSG detached ✓")
 
-        assert rc == 0, f"aria2c download failed (exit {rc}): {out[-300:]}"
+        assert rc == 0, f"aria2c download failed (exit {rc}): {redact_presigned(out[-300:])}"
 
         size_out, verify_rc = self.ssh.run(
             f"test -s {self.pkg.tar_path} && du -sh {self.pkg.tar_path} | awk '{{print $1}}'"
@@ -689,12 +696,17 @@ class ControllerBringup:
                 if "MISSING" in tar_check:
                     aria2c_bin_out, _ = sec_ssh.run("which aria2c")
                     aria2c_bin = aria2c_bin_out.strip() or "/usr/bin/aria2c"
+                    # Signed per node, right before its own download, so a
+                    # slow sibling can't leave this node with a stale link.
+                    dl_url = presign_s3_url(self.pkg.url)
+                    print(f"[setup_secondary_nodes] node{i}: Downloading: {self.pkg.url}")
                     dl_out, dl_rc = sec_ssh.run(
                         f"cd {self.pkg.install_dir} && "
-                        f"sudo {aria2c_bin} -x 16 -s 16 --max-tries=3 --connect-timeout=30 {self.pkg.url} 2>&1",
+                        f"sudo {aria2c_bin} -x 16 -s 16 --max-tries=3 --connect-timeout=30 "
+                        f"-o {shlex.quote(self.pkg.name)} {shlex.quote(dl_url)} 2>&1",
                         timeout=1800
                     )
-                    assert dl_rc == 0, f"Download failed on node{i}: {dl_out[-200:]}"
+                    assert dl_rc == 0, f"Download failed on node{i}: {redact_presigned(dl_out[-200:])}"
                 if sec_nsg:
                     sec_nsg.detach()
                 ext_out, ext_rc = sec_ssh.run(

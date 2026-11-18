@@ -24,6 +24,7 @@ Run standalone:
 
 import os
 import re
+import shlex
 import time
 import pytest
 import yaml
@@ -31,6 +32,7 @@ import requests
 from pathlib import Path
 
 from conftest import CONTROLLER_SUMMARY
+from lib.aws.s3_presign import presign_s3_url, redact_presigned
 
 pytestmark = [pytest.mark.order(2), pytest.mark.controller, pytest.mark.console]
 
@@ -705,11 +707,14 @@ class TestOrgAndUser:
 
         try:
             print(f"[sku_load] Downloading {sku_tarball_url} on controller ...")
+            # Signed right before wget; -O keeps the plain file name.
+            dl_url = presign_s3_url(sku_tarball_url)
             out, rc = ssh_client.run(
                 f"mkdir -p {work_dir} && cd {work_dir} && "
-                f"wget -q '{sku_tarball_url}' && tar -xf {tarball_name}",
+                f"wget -q -O {shlex.quote(tarball_name)} {shlex.quote(dl_url)} && tar -xf {tarball_name}",
                 timeout=300,
             )
+            out = redact_presigned(out)
         finally:
             if nsg_manager:
                 print(f"[sku_load] Detaching NSG -- restoring airgapped state ...")

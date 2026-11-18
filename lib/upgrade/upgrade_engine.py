@@ -45,7 +45,10 @@ Phases, in the order they run:
 """
 
 import re
+import shlex
 import time
+
+from lib.aws.s3_presign import presign_s3_url, redact_presigned
 
 # ── Wait policies ─────────────────────────────────────────────────────────────
 PHASE_WAIT = {
@@ -242,11 +245,15 @@ class UpgradeEngine:
         aria2c_out, _ = self.ssh.run("which aria2c")
         aria2c_bin = aria2c_out.strip() or "/usr/bin/aria2c"
 
+        # Signed here, at download time -- not in __init__ -- because the
+        # upgrade can start an hour or more into the run.
         print(f"[download_new_package] Downloading: {self.dst_package_url}")
         try:
+            dl_url = presign_s3_url(self.dst_package_url)
             out, rc = self.ssh.run(
                 f"sudo {aria2c_bin} -x 16 -s 16 --max-tries=3 --retry-wait=10 "
-                f"--connect-timeout=30 -d {self.install_dir} {self.dst_package_url} 2>&1",
+                f"--connect-timeout=30 -d {self.install_dir} "
+                f"-o {shlex.quote(self.dst_package)} {shlex.quote(dl_url)} 2>&1",
                 timeout=1800
             )
         finally:
@@ -254,7 +261,7 @@ class UpgradeEngine:
                 self.nsg.detach()
                 print("[download_new_package] NSG detached ✓")
 
-        assert rc == 0, f"aria2c download failed (exit {rc}): {out[-300:]}"
+        assert rc == 0, f"aria2c download failed (exit {rc}): {redact_presigned(out[-300:])}"
         print(f"[download_new_package] Downloaded ✓")
 
     def _extract_new_package(self):
